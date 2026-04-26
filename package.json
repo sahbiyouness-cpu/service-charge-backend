@@ -1,0 +1,14 @@
+{
+  "name": "service-charge-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "jszip": "^3.10.1"
+  }
+}
