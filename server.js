@@ -43,13 +43,17 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
       return res.status(400).send("Feuille XML introuvable.");
     }
 
-    const sheetXml = await sheetFile.async("string");
+    let sheetXml = await sheetFile.async("string");
     const sharedStrings = parseSharedStrings(sharedStringsXml || "");
     const rows = parseRows(sheetXml, sharedStrings);
 
-    const result = patchUsingAGLogic(sheetXml, rows);
+    const result = buildAGUpdates(rows);
 
-    zip.file(firstSheetPath, result.xml);
+    for (const item of result.updates) {
+      sheetXml = patchCellValueSafe(sheetXml, item.cellRef, item.value);
+    }
+
+    zip.file(firstSheetPath, sheetXml);
 
     const outputBuffer = await zip.generateAsync({
       type: "nodebuffer",
@@ -163,7 +167,7 @@ function parseRows(sheetXml, sharedStrings) {
         }
       }
 
-      cells.push({ ref, type, value, attrs, inner });
+      cells.push({ ref, type, value });
     }
 
     rows.push({ rowNumber, cells });
@@ -172,13 +176,13 @@ function parseRows(sheetXml, sharedStrings) {
   return rows;
 }
 
-function patchUsingAGLogic(sheetXml, rows) {
-  const FIRST_DATE_COL = 3;
-  const LAST_DATE_COL = 32;
-  const RESULT_COL = 33;
+function buildAGUpdates(rows) {
+  const FIRST_DATE_COL = 3; // C
+  const LAST_DATE_COL = 32; // AF
+  const RESULT_COL = 33;    // AG
 
   const results = [];
-  let updatedXml = sheetXml;
+  const updates = [];
   let blockCount = 0;
   let i = 0;
 
@@ -197,9 +201,8 @@ function patchUsingAGLogic(sheetXml, rows) {
 
     if (markerIndex === -1) break;
 
-    const dataStartIndex = markerIndex + 1;
+    i = markerIndex + 1;
     let processedInBlock = 0;
-    i = dataStartIndex;
 
     while (i < rows.length) {
       const row = rows[i];
@@ -216,10 +219,14 @@ function patchUsingAGLogic(sheetXml, rows) {
           if (matchesWorkedValue(cell?.value)) total++;
         }
 
-        const targetRef = `AG${row.rowNumber}`;
-        updatedXml = patchCellValue(updatedXml, targetRef, total);
-
+        const cellRef = `AG${row.rowNumber}`;
         const nameCell = getCellByColumn(row, 2);
+
+        updates.push({
+          cellRef,
+          value: total
+        });
+
         results.push({
           section: `BLOC ${blockCount + 1}`,
           rowNumber: row.rowNumber,
@@ -240,7 +247,42 @@ function patchUsingAGLogic(sheetXml, rows) {
     i++;
   }
 
-  return { xml: updatedXml, results };
+  return { updates, results };
+}
+
+function patchCellValueSafe(sheetXml, cellRef, numericValue) {
+  const rowNumber = parseInt(cellRef.match(/\d+$/)?.[0] || "", 10);
+  if (!rowNumber) return sheetXml;
+
+  const rowRegex = new RegExp(`(<row\\b[^>]*\\br="${rowNumber}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
+  const rowMatch = sheetXml.match(rowRegex);
+
+  if (!rowMatch) return sheetXml;
+
+  const rowStart = rowMatch[1];
+  const rowInner = rowMatch[2];
+  const rowEnd = rowMatch[3];
+
+  const fullCellRegex = new RegExp(`<c([^>]*\\br="${escapeRegExp(cellRef)}"[^>]*)>([\\s\\S]*?)<\\/c>`);
+  const selfCellRegex = new RegExp(`<c([^>]*\\br="${escapeRegExp(cellRef)}"[^>]*)\\/>`);
+
+  let newRowInner = rowInner;
+
+  if (fullCellRegex.test(rowInner)) {
+    newRowInner = rowInner.replace(fullCellRegex, (match, attrs) => {
+      const attrsNoType = attrs.replace(/\s+t="[^"]*"/g, "");
+      return `<c${attrsNoType}><v>${numericValue}</v></c>`;
+    });
+  } else if (selfCellRegex.test(rowInner)) {
+    newRowInner = rowInner.replace(selfCellRegex, (match, attrs) => {
+      const attrsNoType = attrs.replace(/\s+t="[^"]*"/g, "");
+      return `<c${attrsNoType}><v>${numericValue}</v></c>`;
+    });
+  } else {
+    newRowInner += `<c r="${cellRef}"><v>${numericValue}</v></c>`;
+  }
+
+  return sheetXml.replace(rowRegex, `${rowStart}${newRowInner}${rowEnd}`);
 }
 
 function getCellByColumn(row, colNumber1Based) {
@@ -267,39 +309,6 @@ function hasAnyDataAtoAF(row) {
     if (!isEmptyValue(cell?.value)) return true;
   }
   return false;
-}
-
-function patchCellValue(sheetXml, cellRef, numericValue) {
-  const cellRegexFull = new RegExp(
-    `<c([^>]*\\br="${escapeRegExp(cellRef)}"[^>]*)>([\\s\\S]*?)<\\/c>`
-  );
-  const cellRegexSelf = new RegExp(
-    `<c([^>]*\\br="${escapeRegExp(cellRef)}"[^>]*)\\/>`
-  );
-
-  if (cellRegexFull.test(sheetXml)) {
-    return sheetXml.replace(cellRegexFull, (match, attrs) => {
-      const attrsNoType = attrs.replace(/\s+t="[^"]*"/g, "");
-      return `<c${attrsNoType}><v>${numericValue}</v></c>`;
-    });
-  }
-
-  if (cellRegexSelf.test(sheetXml)) {
-    return sheetXml.replace(cellRegexSelf, (match, attrs) => {
-      const attrsNoType = attrs.replace(/\s+t="[^"]*"/g, "");
-      return `<c${attrsNoType}><v>${numericValue}</v></c>`;
-    });
-  }
-
-  const rowNumber = parseInt(cellRef.match(/\d+$/)?.[0] || "", 10);
-  if (!rowNumber) return sheetXml;
-
-  const rowRegex = new RegExp(`(<row\\b[^>]*\\br="${rowNumber}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
-  if (!rowRegex.test(sheetXml)) return sheetXml;
-
-  return sheetXml.replace(rowRegex, (match, rowStart, rowInner, rowEnd) => {
-    return `${rowStart}${rowInner}<c r="${cellRef}"><v>${numericValue}</v></c>${rowEnd}`;
-  });
 }
 
 function matchesWorkedValue(value) {
