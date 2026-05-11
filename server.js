@@ -104,6 +104,10 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     }
 
     const employees = extractEmployeesFromPlanning(planningWs);
+
+    console.log("EMPLOYEES COUNT =", employees.length);
+    console.log("FIRST EMPLOYEE =", JSON.stringify(employees[0] || null, null, 2));
+
     const summary = buildNavetteSheet(templateWs, employees);
 
     const buffer = await templateWb.xlsx.writeBuffer();
@@ -492,29 +496,32 @@ function buildNavetteSheet(ws, employees) {
   const START_ROW = 5;
   const summary = [];
 
-  unmergeDataArea(ws, START_ROW, 400);
-  clearDataArea(ws, START_ROW, 400);
+  unmergeDataArea(ws, START_ROW, 1000);
 
-  const styleSourceRow = ws.getRow(5);
-
-  let currentRow = START_ROW;
   let totalCA = 0;
   let totalMaladie = 0;
   let totalAT = 0;
   let totalABS = 0;
 
+  let currentRow = START_ROW;
+
   for (const employee of employees) {
     const packedRows = packBlocksIntoRows(employee.blocks);
     const rowCount = Math.max(1, packedRows.length);
 
-    for (let i = 0; i < rowCount; i++) {
-      cloneRowStyle(ws, styleSourceRow, currentRow + i);
+    if (currentRow > START_ROW) {
+      for (let i = 0; i < rowCount; i++) {
+        ws.insertRow(currentRow + i, []);
+        cloneRowStyleFromPrevious(ws, currentRow + i);
+      }
     }
 
     for (let i = 0; i < rowCount; i++) {
       const rowIndex = currentRow + i;
       const row = ws.getRow(rowIndex);
       const packed = packedRows[i] || { CA: null, MALADIE: null, AT: null, ABS: null };
+
+      clearRowValues(row, 1, 20);
 
       if (i === 0) {
         row.getCell(1).value = employee.mat;
@@ -550,13 +557,9 @@ function buildNavetteSheet(ws, employees) {
     currentRow += rowCount;
   }
 
-  const totalRow = currentRow + 1;
-  const preparedRow = totalRow + 1;
-  const drhRow = totalRow + 2;
-
-  cloneRowStyle(ws, styleSourceRow, totalRow);
-  cloneRowStyle(ws, styleSourceRow, preparedRow);
-  cloneRowStyle(ws, styleSourceRow, drhRow);
+  const totalRow = currentRow;
+  const preparedRow = currentRow + 2;
+  const drhRow = currentRow + 3;
 
   ws.getRow(totalRow).getCell(3).value = totalCA;
   ws.getRow(totalRow).getCell(6).value = totalMaladie;
@@ -608,17 +611,14 @@ function writeBlockToRow(row, block, startCol) {
   row.getCell(startCol + 2).value = formatDateFr(block.end);
 }
 
-function clearDataArea(ws, startRow, maxRows) {
-  for (let r = startRow; r < startRow + maxRows; r++) {
-    const row = ws.getRow(r);
-    for (let c = 1; c <= 20; c++) {
-      row.getCell(c).value = null;
-    }
+function clearRowValues(row, startCol, endCol) {
+  for (let c = startCol; c <= endCol; c++) {
+    row.getCell(c).value = null;
   }
 }
 
 function unmergeDataArea(ws, startRow, endRow) {
-  const merges = Array.from(ws._merges);
+  const merges = Array.from(ws._merges || []);
   for (const merge of merges) {
     const m = typeof merge === "string" ? merge : merge.range;
     const match = String(m).match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
@@ -635,8 +635,10 @@ function unmergeDataArea(ws, startRow, endRow) {
   }
 }
 
-function cloneRowStyle(ws, sourceRow, targetRowNumber) {
-  const targetRow = ws.getRow(targetRowNumber);
+function cloneRowStyleFromPrevious(ws, rowNumber) {
+  const sourceRow = ws.getRow(rowNumber - 1);
+  const targetRow = ws.getRow(rowNumber);
+
   targetRow.height = sourceRow.height;
 
   for (let c = 1; c <= 20; c++) {
@@ -647,8 +649,8 @@ function cloneRowStyle(ws, sourceRow, targetRowNumber) {
     if (sourceCell.numFmt) targetCell.numFmt = sourceCell.numFmt;
     if (sourceCell.alignment) targetCell.alignment = { ...sourceCell.alignment };
     if (sourceCell.font) targetCell.font = { ...sourceCell.font };
-    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border));
-    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill));
+    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border || {}));
+    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill || {}));
   }
 }
 
