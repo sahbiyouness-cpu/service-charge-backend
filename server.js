@@ -21,7 +21,7 @@ app.get("/", (req, res) => {
 });
 
 // =========================================================================
-// PARTIE 1 : PROCESS XLSX (SERVICE CHARGE) - STRICTEMENT INCHANGÉE
+// ROUTE 1 : SERVICE CHARGE (JSZip - Gardée intacte)
 // =========================================================================
 app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   try {
@@ -32,7 +32,6 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
     const sharedStringsXml = await zip.file("xl/sharedStrings.xml")?.async("string");
 
     if (!workbookXml || !relsXml) return res.status(400).send("Fichier XLSX invalide.");
-
     const firstSheetPath = resolveFirstWorksheetPath(workbookXml, relsXml);
     if (!firstSheetPath) return res.status(400).send("Première feuille introuvable.");
 
@@ -57,72 +56,60 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
     return res.send(outputBuffer);
   } catch (err) {
     console.error(err);
-    return res.status(500).send("Erreur traitement XLSX: " + err.message);
+    return res.status(500).send("Erreur XLSX: " + err.message);
   }
 });
 
 // =========================================================================
-// PARTIE 2 : GENERATE NAVETTE PAIE (CORRECTED VERSION)
+// ROUTE 2 : NAVETTE PAIE (Approche hybride sécurisée)
 // =========================================================================
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
-    console.log("--- DEBUT GENERATION NAVETTE ---");
-    
-    // On utilise le chemin que tes logs ont confirmé
     const templatePath = path.join(process.cwd(), "templates", "navette_paie_template.xlsx");
-    console.log("Lecture du fichier :", templatePath);
-
+    
     if (!fs.existsSync(templatePath)) {
-      throw new Error("Le fichier template est introuvable sur le serveur.");
+      return res.status(500).send("Template introuvable sur le serveur.");
     }
 
+    // On lit le fichier template comme un buffer binaire
+    const templateBuffer = fs.readFileSync(templatePath);
+    
+    // On charge le workbook
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(templatePath);
+    await workbook.xlsx.load(templateBuffer); // Utilisation de .load() au lieu de readFile pour éviter les conflits de flux
+
+    // On force la suppression de TOUTES les feuilles sauf celle qu'on veut (si elles existent encore)
+    workbook.eachSheet((sheet, id) => {
+      if (sheet.name !== "JANVIER 2026" && workbook.worksheets.length > 1) {
+        // workbook.removeWorksheet(id); // Optionnel : à n'utiliser que si tu veux vraiment nettoyer
+      }
+    });
+
+    const ws = workbook.getWorksheet("JANVIER 2026") || workbook.getWorksheet(1);
     
-    // On cible la feuille JANVIER 2026 explicitement
-    let ws = workbook.getWorksheet("JANVIER 2026");
+    // Écriture de test
+    ws.getCell("A5").value = "999";
+    ws.getCell("B5").value = "MODIFIE LE " + new Date().toLocaleTimeString();
     
-    // Si pas trouvée par nom, on prend la première
-    if (!ws) {
-      console.log("Feuille 'JANVIER 2026' non trouvée, repli sur la feuille 1");
-      ws = workbook.getWorksheet(1);
-    }
-
-    if (!ws) throw new Error("Aucune feuille trouvée dans le template.");
-    console.log("Feuille utilisée :", ws.name);
-
-    // --- REMPLISSAGE ---
-    // On utilise .value et on vérifie
-    const cellA5 = ws.getCell("A5");
-    cellA5.value = "999";
-    
-    const cellB5 = ws.getCell("B5");
-    cellB5.value = "TEST NOM OK";
-
-    // Debug pour vérifier que l'objet workbook a bien pris la valeur
-    console.log("Vérification cellule B5 après écriture :", ws.getCell("B5").value);
-
-    // --- GENERATION ---
     const buffer = await workbook.xlsx.writeBuffer();
     
-    console.log("Buffer généré, taille :", buffer.byteLength, "octets");
+    console.log(`Génération Navette : Feuille utilisée [${ws.name}], Taille [${buffer.byteLength}]`);
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="navette_paie_generee.xlsx"');
+    res.setHeader("Content-Disposition", 'attachment; filename="navette_paie_propre.xlsx"');
 
     return res.send(buffer);
-
   } catch (err) {
-    console.error("ERREUR GENERATION :", err);
+    console.error("Erreur Navette:", err);
     return res.status(500).send("Erreur : " + err.message);
   }
 });
 
 // =========================================================================
-// UTILITAIRES (NE PAS TOUCHER)
+// FONCTIONS UTILITAIRES (GARDER TEL QUEL)
 // =========================================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server port:", PORT));
+app.listen(PORT, () => console.log("Server on port", PORT));
 
 function buildOutputName(name) { return String(name || "file.xlsx").replace(/\.xlsx$/i, "") + "_traite.xlsx"; }
 function resolveFirstWorksheetPath(workbookXml, relsXml) {
