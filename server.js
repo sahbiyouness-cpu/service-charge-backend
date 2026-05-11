@@ -32,11 +32,11 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     await workbookDest.xlsx.readFile(templatePath);
     const sheetDest = workbookDest.getWorksheet("Etat navette paie") || workbookDest.worksheets[0];
 
-    // 1. Récupération des dates réelles à la ligne 11
+    // 1. Récupération des dates réelles (Ligne 11)
     const datesMap = {};
     const row11 = sheetSource.getRow(11);
     for (let col = 3; col <= 32; col++) {
-      datesMap[col] = row11.getCell(col).value; // Stocke l'objet Date ou la valeur brute
+      datesMap[col] = row11.getCell(col).value;
     }
 
     const startRowSource = 13;
@@ -45,20 +45,23 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     sheetSource.eachRow((row, rowNumber) => {
       if (rowNumber < startRowSource) return;
 
-      // On récupère le matricule brut (Original)
       const matricule = row.getCell(1).value;
       const nom = row.getCell(2).value;
       if (!matricule) return;
 
       const sequences = extractSequences(row, datesMap);
 
-      if (sequences.length > 0) {
+      // Si aucune absence, on crée quand même une ligne pour la personne
+      if (sequences.length === 0) {
+        const destRow = sheetDest.getRow(currentDestRow);
+        destRow.getCell(1).value = matricule;
+        destRow.getCell(2).value = nom;
+        currentDestRow++;
+      } else {
         const firstRowIndex = currentDestRow;
 
         sequences.forEach((seq) => {
           const destRow = sheetDest.getRow(currentDestRow);
-          
-          // On écrit les valeurs
           destRow.getCell(1).value = matricule;
           destRow.getCell(2).value = nom;
 
@@ -66,29 +69,28 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
           const startCol = colMap[seq.type];
 
           if (startCol) {
-            // NB JR : On force en Number pour supprimer les "0000"
+            // NB JR : Nombre de jours en format numérique (ex: 9)
             destRow.getCell(startCol).value = Number(seq.count);
-            
-            // DU / AU : On met la date et on définit le format d'affichage
+            destRow.getCell(startCol).numFmt = '0'; // Force le format nombre standard
+
+            // DU / AU : Dates complètes
             const cellDu = destRow.getCell(startCol + 1);
             const cellAu = destRow.getCell(startCol + 2);
-            
             cellDu.value = seq.start;
             cellAu.value = seq.end;
-
-            // Formatage forcé en date courte
             cellDu.numFmt = 'dd/mm/yyyy';
             cellAu.numFmt = 'dd/mm/yyyy';
           }
           currentDestRow++;
         });
 
-        // Fusion si plusieurs séquences pour la même personne
+        // Fusion si plusieurs séquences
         if (sequences.length > 1) {
           sheetDest.mergeCells(firstRowIndex, 1, currentDestRow - 1, 1);
           sheetDest.mergeCells(firstRowIndex, 2, currentDestRow - 1, 2);
-          sheetDest.getRow(firstRowIndex).getCell(1).alignment = { vertical: 'middle', horizontal: 'left' };
-          sheetDest.getRow(firstRowIndex).getCell(2).alignment = { vertical: 'middle', horizontal: 'left' };
+          const align = { vertical: 'middle', horizontal: 'left' };
+          sheetDest.getRow(firstRowIndex).getCell(1).alignment = align;
+          sheetDest.getRow(firstRowIndex).getCell(2).alignment = align;
         }
       }
     });
@@ -109,7 +111,8 @@ function extractSequences(row, datesMap) {
   let current = null;
 
   for (let col = 3; col <= 32; col++) {
-    let val = row.getCell(col).value;
+    let cell = row.getCell(col);
+    let val = cell.value;
     val = val ? String(val).trim().toUpperCase() : null;
 
     if (targets.includes(val)) {
@@ -133,4 +136,4 @@ function extractSequences(row, datesMap) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Serveur démarré sur ${PORT}`));
+app.listen(PORT, () => console.log(`Serveur prêt sur ${PORT}`));
