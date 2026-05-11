@@ -103,13 +103,16 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
       return res.status(500).send("Feuille template introuvable.");
     }
 
-    const employees = extractEmployeesFromPlanning(planningWs);
+    const extraction = extractEmployeesFromPlanning(planningWs);
+    const employees = extraction.employees;
     const summary = buildNavetteSheet(templateWs, employees);
 
     const debugInfo = {
       employeesCount: employees.length,
       firstEmployee: employees[0] || null,
       firstFiveEmployees: employees.slice(0, 5),
+      dateDebug: extraction.dateDebug,
+      firstRowsDebug: extraction.firstRowsDebug,
       summaryPreview: summary.slice(0, 20)
     };
 
@@ -416,13 +419,22 @@ function extractEmployeesFromPlanning(ws) {
   const DATE_START_COL = 3;
   const DATE_END_COL = 32;
 
-  const dates = [];
+  const rawDateCells = [];
   for (let col = DATE_START_COL; col <= DATE_END_COL; col++) {
-    const raw = ws.getRow(11).getCell(col).value;
-    dates.push(normalizeExcelDate(raw));
+    rawDateCells.push(ws.getRow(11).getCell(col).value);
   }
 
+  const year = detectYearFromDateRow(rawDateCells) || 2026;
+  const dates = rawDateCells.map(v => normalizePlanningHeaderDate(v, year));
+
+  const dateDebug = rawDateCells.map((v, i) => ({
+    col: DATE_START_COL + i,
+    raw: debugCellValue(v),
+    normalized: dates[i]
+  }));
+
   let rowNumber = START_ROW;
+  const firstRowsDebug = [];
 
   while (true) {
     const row = ws.getRow(rowNumber);
@@ -443,13 +455,22 @@ function extractEmployeesFromPlanning(ws) {
       break;
     }
 
+    const rowCodesDebug = [];
     const blocks = [];
     let current = null;
 
     for (let idx = 0; idx < dates.length; idx++) {
       const col = DATE_START_COL + idx;
-      const code = normalizeCode(row.getCell(col).value);
+      const rawCell = row.getCell(col).value;
+      const code = normalizeCode(rawCell);
       const date = dates[idx];
+
+      rowCodesDebug.push({
+        col,
+        raw: debugCellValue(rawCell),
+        code,
+        date
+      });
 
       if (!date || !isTrackedCode(code)) {
         if (current) {
@@ -487,16 +508,28 @@ function extractEmployeesFromPlanning(ws) {
       blocks.push(current);
     }
 
-    employees.push({
+    const employee = {
       mat,
       name,
       blocks: blocks.sort((a, b) => a.start.localeCompare(b.start))
-    });
+    };
+
+    employees.push(employee);
+
+    if (firstRowsDebug.length < 3) {
+      firstRowsDebug.push({
+        rowNumber,
+        mat,
+        name,
+        blocks: employee.blocks,
+        cells: rowCodesDebug
+      });
+    }
 
     rowNumber++;
   }
 
-  return employees;
+  return { employees, dateDebug, firstRowsDebug };
 }
 
 function buildNavetteSheet(ws, employees) {
@@ -665,26 +698,58 @@ function cleanCellText(value) {
   if (value == null) return "";
 
   if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (typeof value === "object" && value.text) return String(value.text).trim();
-  if (typeof value === "object" && value.richText) {
-    return value.richText.map(x => x.text || "").join("").trim();
-  }
-  if (typeof value === "object" && value.result != null) {
-    return String(value.result).trim();
+
+  if (typeof value === "object") {
+    if (value.text != null) return String(value.text).trim();
+    if (Array.isArray(value.richText)) return value.richText.map(x => x.text || "").join("").trim();
+    if (value.result != null) return cleanCellText(value.result);
+    if (value.formula != null && value.result != null) return cleanCellText(value.result);
+    if (value.hyperlink && value.text) return String(value.text).trim();
   }
 
   return String(value).trim();
 }
 
 function normalizeCode(value) {
-  return cleanCellText(value).toUpperCase();
+  return cleanCellText(value).replace(/\s+/g, " ").trim().toUpperCase();
 }
 
 function isTrackedCode(code) {
   return code === "CA" || code === "MALADIE" || code === "AT" || code === "ABS";
 }
 
-function normalizeExcelDate(value) {
+function detectYearFromDateRow(values) {
+  for (const v of values) {
+    const year = extractYearFromAnyDateValue(v);
+    if (year) return year;
+  }
+  return null;
+}
+
+function extractYearFromAnyDateValue(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) return value.getFullYear();
+
+  if (typeof value === "object" && value.result instanceof Date) {
+    return value.result.getFullYear();
+  }
+
+  const s = cleanCellText(value);
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (m) {
+    let y = m[3];
+    if (y.length === 2) y = "20" + y;
+    return parseInt(y, 10);
+  }
+
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return d.getFullYear();
+
+  return null;
+}
+
+function normalizePlanningHeaderDate(value, fallbackYear) {
   if (!value) return null;
 
   if (value instanceof Date) {
@@ -695,20 +760,22 @@ function normalizeExcelDate(value) {
     return value.result.toISOString().slice(0, 10);
   }
 
-  if (typeof value === "number") {
-    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
-    const date = new Date(excelEpoch.getTime() + value * 86400000);
-    return date.toISOString().slice(0, 10);
-  }
+  const s = cleanCellText(value);
 
-  const s = String(value).trim();
-  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
+  let m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
   if (m) {
     const dd = m[1].padStart(2, "0");
     const mm = m[2].padStart(2, "0");
-    let yyyy = m[3] || "2026";
+    let yyyy = m[3];
     if (yyyy.length === 2) yyyy = "20" + yyyy;
     return `${yyyy}-${mm}-${dd}`;
+  }
+
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+  if (m) {
+    const dd = m[1].padStart(2, "0");
+    const mm = m[2].padStart(2, "0");
+    return `${fallbackYear}-${mm}-${dd}`;
   }
 
   const d = new Date(s);
@@ -717,6 +784,23 @@ function normalizeExcelDate(value) {
   }
 
   return null;
+}
+
+function debugCellValue(value) {
+  if (value == null) return null;
+  if (value instanceof Date) return { type: "Date", value: value.toISOString() };
+
+  if (typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value)) {
+      const v = value[k];
+      if (v instanceof Date) out[k] = v.toISOString();
+      else out[k] = v;
+    }
+    return out;
+  }
+
+  return value;
 }
 
 function formatDateFr(isoDate) {
