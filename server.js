@@ -103,8 +103,8 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
       return res.status(500).send("Feuille template introuvable.");
     }
 
-    const employees = extractEmployeesFromPlanning(planningWs);
-    const summary = buildNavetteSheet(templateWs, employees);
+    const employees = extractEmployeesFromPlanningSimple(planningWs);
+    const summary = writeNavettePlain(templateWs, employees);
 
     const debugInfo = {
       employeesCount: employees.length,
@@ -410,28 +410,42 @@ function decodeXml(str) {
     .replace(/&#39;/g, "'");
 }
 
-function extractEmployeesFromPlanning(ws) {
+function cleanCellText(value) {
+  if (value == null) return "";
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === "object" && value.text) return String(value.text).trim();
+  if (typeof value === "object" && value.richText) {
+    return value.richText.map(x => x.text || "").join("").trim();
+  }
+  if (typeof value === "object" && value.result != null) {
+    return String(value.result).trim();
+  }
+  return String(value).trim();
+}
+
+function normalizeCode(value) {
+  return cleanCellText(value).replace(/\s+/g, " ").trim().toUpperCase();
+}
+
+function isTrackedCode(code) {
+  return code === "CA" || code === "MALADIE" || code === "AT" || code === "ABS";
+}
+
+function extractEmployeesFromPlanningSimple(ws) {
   const employees = [];
   const START_ROW = 13;
-  const DATE_START_COL = 3;
-  const DATE_END_COL = 32;
-
-  const dates = [];
-  for (let col = DATE_START_COL; col <= DATE_END_COL; col++) {
-    const raw = ws.getRow(11).getCell(col).value;
-    dates.push(normalizeExcelDate(raw));
-  }
+  const START_COL = 3;
+  const END_COL = 32;
 
   let rowNumber = START_ROW;
 
   while (true) {
     const row = ws.getRow(rowNumber);
-
     const mat = cleanCellText(row.getCell(1).value);
     const name = cleanCellText(row.getCell(2).value);
 
     let allDaysEmpty = true;
-    for (let col = DATE_START_COL; col <= DATE_END_COL; col++) {
+    for (let col = START_COL; col <= END_COL; col++) {
       const v = cleanCellText(row.getCell(col).value);
       if (v !== "") {
         allDaysEmpty = false;
@@ -446,12 +460,11 @@ function extractEmployeesFromPlanning(ws) {
     const blocks = [];
     let current = null;
 
-    for (let idx = 0; idx < dates.length; idx++) {
-      const col = DATE_START_COL + idx;
+    for (let col = START_COL; col <= END_COL; col++) {
       const code = normalizeCode(row.getCell(col).value);
-      const date = dates[idx];
+      const dayIndex = col - START_COL + 1;
 
-      if (!date || !isTrackedCode(code)) {
+      if (!isTrackedCode(code)) {
         if (current) {
           blocks.push(current);
           current = null;
@@ -462,22 +475,22 @@ function extractEmployeesFromPlanning(ws) {
       if (!current) {
         current = {
           type: code,
-          start: date,
-          end: date,
+          startDay: dayIndex,
+          endDay: dayIndex,
           days: 1
         };
         continue;
       }
 
       if (current.type === code) {
-        current.end = date;
+        current.endDay = dayIndex;
         current.days += 1;
       } else {
         blocks.push(current);
         current = {
           type: code,
-          start: date,
-          end: date,
+          startDay: dayIndex,
+          endDay: dayIndex,
           days: 1
         };
       }
@@ -490,7 +503,7 @@ function extractEmployeesFromPlanning(ws) {
     employees.push({
       mat,
       name,
-      blocks: blocks.sort((a, b) => a.start.localeCompare(b.start))
+      blocks
     });
 
     rowNumber++;
@@ -499,43 +512,39 @@ function extractEmployeesFromPlanning(ws) {
   return employees;
 }
 
-function buildNavetteSheet(ws, employees) {
+function writeNavettePlain(ws, employees) {
   const START_ROW = 5;
   const summary = [];
 
-  unmergeDataArea(ws, START_ROW, 400);
-  clearDataArea(ws, START_ROW, 400);
-
-  const styleSourceRow = ws.getRow(5);
-
-  let currentRow = START_ROW;
+  let rowIndex = START_ROW;
   let totalCA = 0;
   let totalMaladie = 0;
   let totalAT = 0;
   let totalABS = 0;
 
-  for (const employee of employees) {
-    const packedRows = packBlocksIntoRows(employee.blocks);
-    const rowCount = Math.max(1, packedRows.length);
-
-    for (let i = 0; i < rowCount; i++) {
-      cloneRowStyle(ws, styleSourceRow, currentRow + i);
+  for (let r = START_ROW; r < START_ROW + 300; r++) {
+    for (let c = 1; c <= 20; c++) {
+      ws.getRow(r).getCell(c).value = null;
     }
+  }
 
-    for (let i = 0; i < rowCount; i++) {
-      const rowIndex = currentRow + i;
-      const row = ws.getRow(rowIndex);
-      const packed = packedRows[i] || { CA: null, MALADIE: null, AT: null, ABS: null };
+  for (const employee of employees) {
+    const rows = packBlocksIntoRows(employee.blocks);
+    const usedRows = Math.max(1, rows.length);
+
+    for (let i = 0; i < usedRows; i++) {
+      const row = ws.getRow(rowIndex + i);
+      const packed = rows[i] || { CA: null, MALADIE: null, AT: null, ABS: null };
 
       if (i === 0) {
         row.getCell(1).value = employee.mat;
         row.getCell(2).value = employee.name;
       }
 
-      writeBlockToRow(row, packed.CA, 3);
-      writeBlockToRow(row, packed.MALADIE, 6);
-      writeBlockToRow(row, packed.AT, 9);
-      writeBlockToRow(row, packed.ABS, 12);
+      writeSimpleBlock(row, packed.CA, 3);
+      writeSimpleBlock(row, packed.MALADIE, 6);
+      writeSimpleBlock(row, packed.AT, 9);
+      writeSimpleBlock(row, packed.ABS, 12);
 
       if (packed.CA) totalCA += packed.CA.days;
       if (packed.MALADIE) totalMaladie += packed.MALADIE.days;
@@ -545,41 +554,28 @@ function buildNavetteSheet(ws, employees) {
       summary.push({
         mat: employee.mat,
         name: employee.name,
-        rowNumber: rowIndex,
-        conge: packed.CA ? `${packed.CA.days}j ${formatDateFr(packed.CA.start)} -> ${formatDateFr(packed.CA.end)}` : "",
-        maladie: packed.MALADIE ? `${packed.MALADIE.days}j ${formatDateFr(packed.MALADIE.start)} -> ${formatDateFr(packed.MALADIE.end)}` : "",
-        at: packed.AT ? `${packed.AT.days}j ${formatDateFr(packed.AT.start)} -> ${formatDateFr(packed.AT.end)}` : "",
-        abs: packed.ABS ? `${packed.ABS.days}j ${formatDateFr(packed.ABS.start)} -> ${formatDateFr(packed.ABS.end)}` : ""
+        rowNumber: rowIndex + i,
+        conge: packed.CA ? `${packed.CA.days}j J${packed.CA.startDay} -> J${packed.CA.endDay}` : "",
+        maladie: packed.MALADIE ? `${packed.MALADIE.days}j J${packed.MALADIE.startDay} -> J${packed.MALADIE.endDay}` : "",
+        at: packed.AT ? `${packed.AT.days}j J${packed.AT.startDay} -> J${packed.AT.endDay}` : "",
+        abs: packed.ABS ? `${packed.ABS.days}j J${packed.ABS.startDay} -> J${packed.ABS.endDay}` : ""
       });
     }
 
-    if (rowCount > 1) {
-      ws.mergeCells(currentRow, 1, currentRow + rowCount - 1, 1);
-      ws.mergeCells(currentRow, 2, currentRow + rowCount - 1, 2);
-    }
-
-    currentRow += rowCount;
+    rowIndex += usedRows;
   }
 
-  const totalRow = currentRow + 1;
-  const preparedRow = totalRow + 1;
-  const drhRow = totalRow + 2;
+  ws.getRow(rowIndex + 1).getCell(3).value = totalCA;
+  ws.getRow(rowIndex + 1).getCell(6).value = totalMaladie;
+  ws.getRow(rowIndex + 1).getCell(9).value = totalAT;
+  ws.getRow(rowIndex + 1).getCell(12).value = totalABS;
+  ws.getRow(rowIndex + 1).getCell(15).value = 0;
+  ws.getRow(rowIndex + 1).getCell(19).value = 0;
+  ws.getRow(rowIndex + 1).getCell(20).value = 0;
 
-  cloneRowStyle(ws, styleSourceRow, totalRow);
-  cloneRowStyle(ws, styleSourceRow, preparedRow);
-  cloneRowStyle(ws, styleSourceRow, drhRow);
-
-  ws.getRow(totalRow).getCell(3).value = totalCA;
-  ws.getRow(totalRow).getCell(6).value = totalMaladie;
-  ws.getRow(totalRow).getCell(9).value = totalAT;
-  ws.getRow(totalRow).getCell(12).value = totalABS;
-  ws.getRow(totalRow).getCell(15).value = 0;
-  ws.getRow(totalRow).getCell(19).value = 0;
-  ws.getRow(totalRow).getCell(20).value = 0;
-
-  ws.getRow(preparedRow).getCell(2).value = "Préparé par :";
-  ws.getRow(drhRow).getCell(2).value = "Direction Ressources Humaines";
-  ws.getRow(drhRow).getCell(17).value = "Directeur Général";
+  ws.getRow(rowIndex + 3).getCell(2).value = "Préparé par :";
+  ws.getRow(rowIndex + 4).getCell(2).value = "Direction Ressources Humaines";
+  ws.getRow(rowIndex + 4).getCell(17).value = "Directeur Général";
 
   return summary;
 }
@@ -599,128 +595,18 @@ function packBlocksIntoRows(blocks) {
     }
 
     if (!placed) {
-      rows.push({
-        CA: null,
-        MALADIE: null,
-        AT: null,
-        ABS: null
-      });
-      rows[rows.length - 1][block.type] = block;
+      const newRow = { CA: null, MALADIE: null, AT: null, ABS: null };
+      newRow[block.type] = block;
+      rows.push(newRow);
     }
   }
 
   return rows;
 }
 
-function writeBlockToRow(row, block, startCol) {
+function writeSimpleBlock(row, block, startCol) {
   if (!block) return;
   row.getCell(startCol).value = block.days;
-  row.getCell(startCol + 1).value = formatDateFr(block.start);
-  row.getCell(startCol + 2).value = formatDateFr(block.end);
-}
-
-function clearDataArea(ws, startRow, maxRows) {
-  for (let r = startRow; r < startRow + maxRows; r++) {
-    const row = ws.getRow(r);
-    for (let c = 1; c <= 20; c++) {
-      row.getCell(c).value = null;
-    }
-  }
-}
-
-function unmergeDataArea(ws, startRow, endRow) {
-  const merges = Array.from(ws._merges || []);
-  for (const merge of merges) {
-    const m = typeof merge === "string" ? merge : merge.range;
-    const match = String(m).match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
-    if (!match) continue;
-
-    const r1 = parseInt(match[2], 10);
-    const r2 = parseInt(match[4], 10);
-
-    if (r2 >= startRow && r1 <= endRow) {
-      try {
-        ws.unMergeCells(m);
-      } catch {}
-    }
-  }
-}
-
-function cloneRowStyle(ws, sourceRow, targetRowNumber) {
-  const targetRow = ws.getRow(targetRowNumber);
-  targetRow.height = sourceRow.height;
-
-  for (let c = 1; c <= 20; c++) {
-    const sourceCell = sourceRow.getCell(c);
-    const targetCell = targetRow.getCell(c);
-
-    targetCell.style = JSON.parse(JSON.stringify(sourceCell.style || {}));
-    if (sourceCell.numFmt) targetCell.numFmt = sourceCell.numFmt;
-    if (sourceCell.alignment) targetCell.alignment = { ...sourceCell.alignment };
-    if (sourceCell.font) targetCell.font = { ...sourceCell.font };
-    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border || {}));
-    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill || {}));
-  }
-}
-
-function cleanCellText(value) {
-  if (value == null) return "";
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (typeof value === "object" && value.text) return String(value.text).trim();
-  if (typeof value === "object" && value.richText) {
-    return value.richText.map(x => x.text || "").join("").trim();
-  }
-  if (typeof value === "object" && value.result != null) {
-    return String(value.result).trim();
-  }
-  return String(value).trim();
-}
-
-function normalizeCode(value) {
-  return cleanCellText(value).toUpperCase();
-}
-
-function isTrackedCode(code) {
-  return code === "CA" || code === "MALADIE" || code === "AT" || code === "ABS";
-}
-
-function normalizeExcelDate(value) {
-  if (!value) return null;
-
-  if (value instanceof Date) {
-    return value.toISOString().slice(0, 10);
-  }
-
-  if (typeof value === "object" && value.result instanceof Date) {
-    return value.result.toISOString().slice(0, 10);
-  }
-
-  if (typeof value === "number") {
-    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
-    const date = new Date(excelEpoch.getTime() + value * 86400000);
-    return date.toISOString().slice(0, 10);
-  }
-
-  const s = String(value).trim();
-  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
-  if (m) {
-    const dd = m[1].padStart(2, "0");
-    const mm = m[2].padStart(2, "0");
-    let yyyy = m[3] || "2026";
-    if (yyyy.length === 2) yyyy = "20" + yyyy;
-    return `${yyyy}-${mm}-${dd}`;
-  }
-
-  const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) {
-    return d.toISOString().slice(0, 10);
-  }
-
-  return null;
-}
-
-function formatDateFr(isoDate) {
-  if (!isoDate) return "";
-  const [y, m, d] = isoDate.split("-");
-  return `${d}/${m}/${y}`;
+  row.getCell(startCol + 1).value = `J${block.startDay}`;
+  row.getCell(startCol + 2).value = `J${block.endDay}`;
 }
