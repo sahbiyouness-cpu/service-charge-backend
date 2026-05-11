@@ -104,11 +104,14 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     }
 
     const employees = extractEmployeesFromPlanning(planningWs);
-
-    console.log("EMPLOYEES COUNT =", employees.length);
-    console.log("FIRST EMPLOYEE =", JSON.stringify(employees[0] || null, null, 2));
-
     const summary = buildNavetteSheet(templateWs, employees);
+
+    const debugInfo = {
+      employeesCount: employees.length,
+      firstEmployee: employees[0] || null,
+      firstFiveEmployees: employees.slice(0, 5),
+      summaryPreview: summary.slice(0, 20)
+    };
 
     const buffer = await templateWb.xlsx.writeBuffer();
 
@@ -123,6 +126,10 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     res.setHeader(
       "X-Results",
       encodeURIComponent(JSON.stringify(summary.slice(0, 500)))
+    );
+    res.setHeader(
+      "X-Debug-Navette",
+      encodeURIComponent(JSON.stringify(debugInfo))
     );
 
     return res.send(Buffer.from(buffer));
