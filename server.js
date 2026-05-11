@@ -1,6 +1,7 @@
 import express from "express";
 import multer from "multer";
 import JSZip from "jszip";
+import ExcelJS from "exceljs";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -80,6 +81,53 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   }
 });
 
+app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).send("Fichier manquant.");
+    }
+
+    const planningWb = new ExcelJS.Workbook();
+    await planningWb.xlsx.load(req.file.buffer);
+
+    const planningWs = planningWb.worksheets[planningWb.worksheets.length - 1];
+    if (!planningWs) {
+      return res.status(400).send("Dernière feuille introuvable.");
+    }
+
+    const templateWb = new ExcelJS.Workbook();
+    await templateWb.xlsx.readFile("templates/navette_paie_template.xlsx");
+
+    const templateWs = templateWb.worksheets[0];
+    if (!templateWs) {
+      return res.status(500).send("Feuille template introuvable.");
+    }
+
+    const employees = extractEmployeesFromPlanning(planningWs);
+    const summary = buildNavetteSheet(templateWs, employees);
+
+    const buffer = await templateWb.xlsx.writeBuffer();
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${buildNavetteOutputName(req.file.originalname)}"`
+    );
+    res.setHeader(
+      "X-Results",
+      encodeURIComponent(JSON.stringify(summary.slice(0, 500)))
+    );
+
+    return res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send("Erreur génération navette paie: " + err.message);
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server started on port", PORT);
@@ -87,6 +135,10 @@ app.listen(PORT, () => {
 
 function buildOutputName(name) {
   return String(name || "service_charge.xlsx").replace(/\.xlsx$/i, "") + "_traite.xlsx";
+}
+
+function buildNavetteOutputName(name) {
+  return String(name || "navette_paie.xlsx").replace(/\.xlsx$/i, "") + "_navette_paie.xlsx";
 }
 
 function resolveFirstWorksheetPath(workbookXml, relsXml) {
@@ -177,9 +229,9 @@ function parseRows(sheetXml, sharedStrings) {
 }
 
 function buildAGUpdates(rows) {
-  const FIRST_DATE_COL = 3; // C
-  const LAST_DATE_COL = 32; // AF
-  const RESULT_COL = 33;    // AG
+  const FIRST_DATE_COL = 3;
+  const LAST_DATE_COL = 32;
+  const RESULT_COL = 33;
 
   const results = [];
   const updates = [];
@@ -345,4 +397,321 @@ function decodeXml(str) {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
+}
+
+function extractEmployeesFromPlanning(ws) {
+  const employees = [];
+  const START_ROW = 13;
+  const DATE_START_COL = 3;
+  const DATE_END_COL = 32;
+
+  const dates = [];
+  for (let col = DATE_START_COL; col <= DATE_END_COL; col++) {
+    const raw = ws.getRow(11).getCell(col).value;
+    dates.push(normalizeExcelDate(raw));
+  }
+
+  let rowNumber = START_ROW;
+
+  while (true) {
+    const row = ws.getRow(rowNumber);
+
+    const mat = cleanCellText(row.getCell(1).value);
+    const name = cleanCellText(row.getCell(2).value);
+
+    let allDaysEmpty = true;
+    for (let col = DATE_START_COL; col <= DATE_END_COL; col++) {
+      const v = cleanCellText(row.getCell(col).value);
+      if (v !== "") {
+        allDaysEmpty = false;
+        break;
+      }
+    }
+
+    if (mat === "" && name === "" && allDaysEmpty) {
+      break;
+    }
+
+    const blocks = [];
+    let current = null;
+
+    for (let idx = 0; idx < dates.length; idx++) {
+      const col = DATE_START_COL + idx;
+      const code = normalizeCode(row.getCell(col).value);
+      const date = dates[idx];
+
+      if (!date || !isTrackedCode(code)) {
+        if (current) {
+          blocks.push(current);
+          current = null;
+        }
+        continue;
+      }
+
+      if (!current) {
+        current = {
+          type: code,
+          start: date,
+          end: date,
+          days: 1
+        };
+        continue;
+      }
+
+      if (current.type === code) {
+        current.end = date;
+        current.days += 1;
+      } else {
+        blocks.push(current);
+        current = {
+          type: code,
+          start: date,
+          end: date,
+          days: 1
+        };
+      }
+    }
+
+    if (current) {
+      blocks.push(current);
+    }
+
+    employees.push({
+      mat,
+      name,
+      blocks: blocks.sort((a, b) => a.start.localeCompare(b.start))
+    });
+
+    rowNumber++;
+  }
+
+  return employees;
+}
+
+function buildNavetteSheet(ws, employees) {
+  const START_ROW = 5;
+  const summary = [];
+
+  unmergeDataArea(ws, START_ROW, 400);
+  clearDataArea(ws, START_ROW, 400);
+
+  const styleSourceRow = ws.getRow(5);
+
+  let currentRow = START_ROW;
+  let totalCA = 0;
+  let totalMaladie = 0;
+  let totalAT = 0;
+  let totalABS = 0;
+
+  for (const employee of employees) {
+    const packedRows = packBlocksIntoRows(employee.blocks);
+    const rowCount = Math.max(1, packedRows.length);
+
+    for (let i = 0; i < rowCount; i++) {
+      cloneRowStyle(ws, styleSourceRow, currentRow + i);
+    }
+
+    for (let i = 0; i < rowCount; i++) {
+      const rowIndex = currentRow + i;
+      const row = ws.getRow(rowIndex);
+      const packed = packedRows[i] || { CA: null, MALADIE: null, AT: null, ABS: null };
+
+      if (i === 0) {
+        row.getCell(1).value = employee.mat;
+        row.getCell(2).value = employee.name;
+      }
+
+      writeBlockToRow(row, packed.CA, 3);
+      writeBlockToRow(row, packed.MALADIE, 6);
+      writeBlockToRow(row, packed.AT, 9);
+      writeBlockToRow(row, packed.ABS, 12);
+
+      if (packed.CA) totalCA += packed.CA.days;
+      if (packed.MALADIE) totalMaladie += packed.MALADIE.days;
+      if (packed.AT) totalAT += packed.AT.days;
+      if (packed.ABS) totalABS += packed.ABS.days;
+
+      summary.push({
+        mat: employee.mat,
+        name: employee.name,
+        rowNumber: rowIndex,
+        conge: packed.CA ? `${packed.CA.days}j ${formatDateFr(packed.CA.start)} -> ${formatDateFr(packed.CA.end)}` : "",
+        maladie: packed.MALADIE ? `${packed.MALADIE.days}j ${formatDateFr(packed.MALADIE.start)} -> ${formatDateFr(packed.MALADIE.end)}` : "",
+        at: packed.AT ? `${packed.AT.days}j ${formatDateFr(packed.AT.start)} -> ${formatDateFr(packed.AT.end)}` : "",
+        abs: packed.ABS ? `${packed.ABS.days}j ${formatDateFr(packed.ABS.start)} -> ${formatDateFr(packed.ABS.end)}` : ""
+      });
+    }
+
+    if (rowCount > 1) {
+      ws.mergeCells(currentRow, 1, currentRow + rowCount - 1, 1);
+      ws.mergeCells(currentRow, 2, currentRow + rowCount - 1, 2);
+    }
+
+    currentRow += rowCount;
+  }
+
+  const totalRow = currentRow + 1;
+  const preparedRow = totalRow + 1;
+  const drhRow = totalRow + 2;
+
+  cloneRowStyle(ws, styleSourceRow, totalRow);
+  cloneRowStyle(ws, styleSourceRow, preparedRow);
+  cloneRowStyle(ws, styleSourceRow, drhRow);
+
+  ws.getRow(totalRow).getCell(3).value = totalCA;
+  ws.getRow(totalRow).getCell(6).value = totalMaladie;
+  ws.getRow(totalRow).getCell(9).value = totalAT;
+  ws.getRow(totalRow).getCell(12).value = totalABS;
+  ws.getRow(totalRow).getCell(15).value = 0;
+  ws.getRow(totalRow).getCell(19).value = 0;
+  ws.getRow(totalRow).getCell(20).value = 0;
+
+  ws.getRow(preparedRow).getCell(2).value = "Préparé par :";
+  ws.getRow(drhRow).getCell(2).value = "Direction Ressources Humaines";
+  ws.getRow(drhRow).getCell(17).value = "Directeur Général";
+
+  return summary;
+}
+
+function packBlocksIntoRows(blocks) {
+  const rows = [];
+
+  for (const block of blocks) {
+    let placed = false;
+
+    for (const row of rows) {
+      if (!row[block.type]) {
+        row[block.type] = block;
+        placed = true;
+        break;
+      }
+    }
+
+    if (!placed) {
+      rows.push({
+        CA: null,
+        MALADIE: null,
+        AT: null,
+        ABS: null
+      });
+      rows[rows.length - 1][block.type] = block;
+    }
+  }
+
+  return rows;
+}
+
+function writeBlockToRow(row, block, startCol) {
+  if (!block) return;
+  row.getCell(startCol).value = block.days;
+  row.getCell(startCol + 1).value = formatDateFr(block.start);
+  row.getCell(startCol + 2).value = formatDateFr(block.end);
+}
+
+function clearDataArea(ws, startRow, maxRows) {
+  for (let r = startRow; r < startRow + maxRows; r++) {
+    const row = ws.getRow(r);
+    for (let c = 1; c <= 20; c++) {
+      row.getCell(c).value = null;
+    }
+  }
+}
+
+function unmergeDataArea(ws, startRow, endRow) {
+  const merges = Array.from(ws._merges);
+  for (const merge of merges) {
+    const m = typeof merge === "string" ? merge : merge.range;
+    const match = String(m).match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
+    if (!match) continue;
+
+    const r1 = parseInt(match[2], 10);
+    const r2 = parseInt(match[4], 10);
+
+    if (r2 >= startRow && r1 <= endRow) {
+      try {
+        ws.unMergeCells(m);
+      } catch {}
+    }
+  }
+}
+
+function cloneRowStyle(ws, sourceRow, targetRowNumber) {
+  const targetRow = ws.getRow(targetRowNumber);
+  targetRow.height = sourceRow.height;
+
+  for (let c = 1; c <= 20; c++) {
+    const sourceCell = sourceRow.getCell(c);
+    const targetCell = targetRow.getCell(c);
+
+    targetCell.style = JSON.parse(JSON.stringify(sourceCell.style || {}));
+    if (sourceCell.numFmt) targetCell.numFmt = sourceCell.numFmt;
+    if (sourceCell.alignment) targetCell.alignment = { ...sourceCell.alignment };
+    if (sourceCell.font) targetCell.font = { ...sourceCell.font };
+    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border));
+    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill));
+  }
+}
+
+function cleanCellText(value) {
+  if (value == null) return "";
+
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  if (typeof value === "object" && value.text) return String(value.text).trim();
+  if (typeof value === "object" && value.richText) {
+    return value.richText.map(x => x.text || "").join("").trim();
+  }
+  if (typeof value === "object" && value.result != null) {
+    return String(value.result).trim();
+  }
+
+  return String(value).trim();
+}
+
+function normalizeCode(value) {
+  return cleanCellText(value).toUpperCase();
+}
+
+function isTrackedCode(code) {
+  return code === "CA" || code === "MALADIE" || code === "AT" || code === "ABS";
+}
+
+function normalizeExcelDate(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  if (typeof value === "object" && value.result instanceof Date) {
+    return value.result.toISOString().slice(0, 10);
+  }
+
+  if (typeof value === "number") {
+    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+    const date = new Date(excelEpoch.getTime() + value * 86400000);
+    return date.toISOString().slice(0, 10);
+  }
+
+  const s = String(value).trim();
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
+  if (m) {
+    const dd = m[1].padStart(2, "0");
+    const mm = m[2].padStart(2, "0");
+    let yyyy = m[3] || "2026";
+    if (yyyy.length === 2) yyyy = "20" + yyyy;
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) {
+    return d.toISOString().slice(0, 10);
+  }
+
+  return null;
+}
+
+function formatDateFr(isoDate) {
+  if (!isoDate) return "";
+  const [y, m, d] = isoDate.split("-");
+  return `${d}/${m}/${y}`;
 }
