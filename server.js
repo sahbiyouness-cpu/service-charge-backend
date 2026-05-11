@@ -20,7 +20,7 @@ app.get("/", (req, res) => {
   res.send("Backend Service Charge OK");
 });
 
-// --- ROUTE 1 : PROCESS XLSX (Ton ancien code JSZip pour le service charge) ---
+// --- ROUTE 1 : PROCESS XLSX (Traitement JSZip) ---
 app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).send("Fichier manquant.");
@@ -59,60 +59,65 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   }
 });
 
-// --- ROUTE 2 : GENERATE NAVETTE PAIE (Le code corrigé pour ExcelJS) ---
+// --- ROUTE 2 : GENERATE NAVETTE PAIE (ExcelJS Corrigé) ---
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
-    console.log("Début de la génération de la navette...");
-    const templateWb = new ExcelJS.Workbook();
+    console.log("--- NOUVELLE TENTATIVE GENERATION ---");
+    const workbook = new ExcelJS.Workbook();
     
-    // Correction du chemin pour Render : process.cwd() est plus fiable
+    // Chemin absolu vers la racine du projet sur Render
     const templatePath = path.join(process.cwd(), "templates", "navette_paie_template.xlsx");
-    
-    console.log("Tentative de lecture du fichier :", templatePath);
+    console.log("Recherche du fichier ici :", templatePath);
 
-    // Chargement du template
-    await templateWb.xlsx.readFile(templatePath).catch(err => {
-        throw new Error("Impossible de lire le fichier template. Vérifiez qu'il est bien dans le dossier /templates.");
+    // Lecture du fichier
+    await workbook.xlsx.readFile(templatePath).catch(err => {
+      throw new Error("Fichier introuvable sur le disque. Vérifie que le dossier 'templates' est bien poussé sur GitHub.");
     });
 
-    // On récupère la première feuille (index 1 avec ExcelJS)
-    const ws = templateWb.getWorksheet(1);
+    // On liste les feuilles pour le debug dans Render
+    const sheetNames = workbook.worksheets.map(w => w.name);
+    console.log("Feuilles trouvées dans le template :", sheetNames);
+
+    // D'après tes fichiers, on cherche "JANVIER 2026" ou la première feuille
+    // On prend la première feuille visible pour être sûr
+    const ws = workbook.getWorksheet(1); 
+    
     if (!ws) {
-      return res.status(500).send("La feuille de calcul n'a pas pu être trouvée dans le template.");
+      throw new Error("Aucune feuille de calcul trouvée dans le fichier.");
     }
 
-    console.log("Lecture de la feuille : OK (" + ws.name + ")");
+    console.log("Écriture sur la feuille :", ws.name);
 
-    // Exemple de remplissage (Tu peux adapter avec tes données req.body si besoin)
-    ws.getCell("A1").value = "NAVETTE GÉNÉRÉE LE " + new Date().toLocaleDateString();
+    // FORCE L'ÉCRITURE SUR DES CELLULES EXISTANTES (Basé sur ton CSV)
+    // A5 = MAT, B5 = NOM, C5 = Congé Payé NB JR
+    ws.getCell("A5").value = "999";
+    ws.getCell("B5").value = "TEST NOM RENDER";
+    ws.getCell("C5").value = 10;
     
-    // On écrit dans des cellules spécifiques pour tester
-    const row5 = ws.getRow(5);
-    row5.getCell(1).value = "999"; // MAT
-    row5.getCell(2).value = "TEST NOM"; // NOM
-    row5.commit();
+    // On ajoute un test en A1 pour voir si le fichier est modifié
+    ws.getCell("A1").value = "MODIFIÉ PAR LE SERVEUR";
 
-    // Génération du buffer final
-    const buffer = await templateWb.xlsx.writeBuffer();
-    console.log("Buffer généré, taille :", buffer.byteLength, "octets");
+    // Génération du buffer
+    const buffer = await workbook.xlsx.writeBuffer();
+    console.log("Génération réussie. Taille du buffer :", buffer.byteLength);
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", 'attachment; filename="navette_paie_generee.xlsx"');
-
+    
     return res.send(buffer);
 
   } catch (err) {
-    console.error("ERREUR SERVEUR:", err.message);
-    return res.status(500).send("Erreur lors de la génération : " + err.message);
+    console.error("ERREUR CRITIQUE :", err.message);
+    return res.status(500).send("Erreur : " + err.message);
   }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("Serveur démarré sur le port", PORT);
+  console.log("Serveur en ligne sur le port", PORT);
 });
 
-// --- TOUTES TES FONCTIONS UTILITAIRES (GARDÉES TEL QUEL) ---
+// --- FONCTIONS UTILITAIRES ---
 
 function buildOutputName(name) {
   return String(name || "service_charge.xlsx").replace(/\.xlsx$/i, "") + "_traite.xlsx";
