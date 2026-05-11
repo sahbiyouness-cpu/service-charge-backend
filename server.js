@@ -2,10 +2,17 @@ import express from "express";
 import multer from "multer";
 import JSZip from "jszip";
 import ExcelJS from "exceljs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+// Configuration pour récupérer le chemin du répertoire en mode ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
+// Middleware CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -18,6 +25,7 @@ app.get("/", (req, res) => {
   res.send("Backend Service Charge OK");
 });
 
+// --- ROUTE 1 : PROCESS XLSX (Traitement manuel XML) ---
 app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
@@ -81,34 +89,37 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   }
 });
 
+// --- ROUTE 2 : GENERATE NAVETTE PAIE (ExcelJS corrigé) ---
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
     const templateWb = new ExcelJS.Workbook();
-    await templateWb.xlsx.readFile("templates/navette_paie_template.xlsx");
+    // Utilisation de path.join pour garantir le chemin sur Render
+    const templatePath = path.join(__dirname, "templates", "navette_paie_template.xlsx");
+    
+    await templateWb.xlsx.readFile(templatePath);
 
-    const debugSheets = templateWb.worksheets.map((ws, i) => ({
-      index: i,
-      name: ws.name,
-      rowCount: ws.rowCount,
-      columnCount: ws.columnCount
-    }));
-
-    const ws = templateWb.worksheets[0];
+    // Sélection de la première feuille de calcul
+    const ws = templateWb.getWorksheet(1);
     if (!ws) {
       return res.status(500).send("Feuille template introuvable.");
     }
 
-    // Ecriture très visible
+    // Ecriture explicite via les lignes pour garantir la visibilité
     ws.getCell("A1").value = "TEST A1";
-    ws.getCell("A5").value = "TEST MAT";
-    ws.getCell("B5").value = "TEST NOM";
-    ws.getCell("C5").value = 999;
-    ws.getCell("D5").value = "J1";
-    ws.getCell("E5").value = "J3";
+    
+    const row5 = ws.getRow(5);
+    row5.getCell(1).value = "TEST MAT"; // A5
+    row5.getCell(2).value = "TEST NOM"; // B5
+    row5.getCell(3).value = 999;        // C5
+    row5.getCell(4).value = "J1";       // D5
+    row5.getCell(5).value = "J3";       // E5
+    row5.commit();
 
-    ws.getCell("A6").value = "LIGNE 6";
-    ws.getCell("B6").value = "VISIBLE ?";
-    ws.getCell("C6").value = 123;
+    const row6 = ws.getRow(6);
+    row6.getCell(1).value = "LIGNE 6";
+    row6.getCell(2).value = "VISIBLE ?";
+    row6.getCell(3).value = 123;
+    row6.commit();
 
     const buffer = await templateWb.xlsx.writeBuffer();
 
@@ -118,20 +129,12 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     );
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="test_template_visible.xlsx"`
-    );
-    res.setHeader(
-      "X-Debug-Navette",
-      encodeURIComponent(JSON.stringify({
-        ok: true,
-        sheets: debugSheets,
-        wrote: ["A1", "A5", "B5", "C5", "D5", "E5", "A6", "B6", "C6"]
-      }))
+      'attachment; filename="navette_paie_generee.xlsx"'
     );
 
-    return res.send(Buffer.from(buffer));
+    return res.send(buffer);
   } catch (err) {
-    console.error(err);
+    console.error("Erreur Navette:", err);
     return res.status(500).send("Erreur génération navette paie: " + err.message);
   }
 });
@@ -140,6 +143,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server started on port", PORT);
 });
+
+// --- FONCTIONS UTILITAIRES ---
 
 function buildOutputName(name) {
   return String(name || "service_charge.xlsx").replace(/\.xlsx$/i, "") + "_traite.xlsx";
@@ -158,26 +163,21 @@ function resolveFirstWorksheetPath(workbookXml, relsXml) {
 
   let target = relMatch[1];
   target = target.replace(/^\/+/, "");
-
   if (!target.startsWith("xl/")) {
     target = "xl/" + target.replace(/^\.?\//, "");
   }
-
   return target;
 }
 
 function parseSharedStrings(xml) {
   if (!xml) return [];
-
   const result = [];
   const siMatches = xml.match(/<si[\s\S]*?<\/si>/g) || [];
-
   for (const si of siMatches) {
     const tMatches = [...si.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)];
     const text = tMatches.map(m => decodeXml(m[1])).join("");
     result.push(text);
   }
-
   return result;
 }
 
@@ -222,13 +222,10 @@ function parseRows(sheetXml, sharedStrings) {
           value = tMatches.map(m => decodeXml(m[1])).join("");
         }
       }
-
       cells.push({ ref, type, value });
     }
-
     rows.push({ rowNumber, cells });
   }
-
   return rows;
 }
 
@@ -236,7 +233,6 @@ function buildAGUpdates(rows) {
   const FIRST_DATE_COL = 3;
   const LAST_DATE_COL = 32;
   const RESULT_COL = 33;
-
   const results = [];
   const updates = [];
   let blockCount = 0;
@@ -244,65 +240,43 @@ function buildAGUpdates(rows) {
 
   while (i < rows.length) {
     let markerIndex = -1;
-
     for (; i < rows.length; i++) {
       const row = rows[i];
       const agCell = getCellByColumn(row, RESULT_COL);
-
       if (agCell && !isEmptyValue(agCell.value)) {
         markerIndex = i;
         break;
       }
     }
-
     if (markerIndex === -1) break;
 
     i = markerIndex + 1;
     let processedInBlock = 0;
-
     while (i < rows.length) {
       const row = rows[i];
-
-      if (isRowEmptyAtoAF(row)) {
-        break;
-      }
-
+      if (isRowEmptyAtoAF(row)) break;
       if (hasAnyDataAtoAF(row)) {
         let total = 0;
-
         for (let col = FIRST_DATE_COL; col <= LAST_DATE_COL; col++) {
           const cell = getCellByColumn(row, col);
           if (matchesWorkedValue(cell?.value)) total++;
         }
-
         const cellRef = `AG${row.rowNumber}`;
         const nameCell = getCellByColumn(row, 2);
-
-        updates.push({
-          cellRef,
-          value: total
-        });
-
+        updates.push({ cellRef, value: total });
         results.push({
           section: `BLOC ${blockCount + 1}`,
           rowNumber: row.rowNumber,
           name: String(nameCell?.value || ""),
           total
         });
-
         processedInBlock++;
       }
-
       i++;
     }
-
-    if (processedInBlock > 0) {
-      blockCount++;
-    }
-
+    if (processedInBlock > 0) blockCount++;
     i++;
   }
-
   return { updates, results };
 }
 
@@ -312,7 +286,6 @@ function patchCellValueSafe(sheetXml, cellRef, numericValue) {
 
   const rowRegex = new RegExp(`(<row\\b[^>]*\\br="${rowNumber}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
   const rowMatch = sheetXml.match(rowRegex);
-
   if (!rowMatch) return sheetXml;
 
   const rowStart = rowMatch[1];
@@ -323,7 +296,6 @@ function patchCellValueSafe(sheetXml, cellRef, numericValue) {
   const selfCellRegex = new RegExp(`<c([^>]*\\br="${escapeRegExp(cellRef)}"[^>]*)\\/>`);
 
   let newRowInner = rowInner;
-
   if (fullCellRegex.test(rowInner)) {
     newRowInner = rowInner.replace(fullCellRegex, (match, attrs) => {
       const attrsNoType = attrs.replace(/\s+t="[^"]*"/g, "");
@@ -337,7 +309,6 @@ function patchCellValueSafe(sheetXml, cellRef, numericValue) {
   } else {
     newRowInner += `<c r="${cellRef}"><v>${numericValue}</v></c>`;
   }
-
   return sheetXml.replace(rowRegex, `${rowStart}${newRowInner}${rowEnd}`);
 }
 
