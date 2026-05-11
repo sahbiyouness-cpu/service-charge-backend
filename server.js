@@ -83,35 +83,32 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
 
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).send("Fichier manquant.");
-    }
-
-    const planningWb = new ExcelJS.Workbook();
-    await planningWb.xlsx.load(req.file.buffer);
-
-    const planningWs = planningWb.worksheets[planningWb.worksheets.length - 1];
-    if (!planningWs) {
-      return res.status(400).send("Dernière feuille introuvable.");
-    }
-
     const templateWb = new ExcelJS.Workbook();
     await templateWb.xlsx.readFile("templates/navette_paie_template.xlsx");
 
-    const templateWs = templateWb.worksheets[0];
-    if (!templateWs) {
+    const debugSheets = templateWb.worksheets.map((ws, i) => ({
+      index: i,
+      name: ws.name,
+      rowCount: ws.rowCount,
+      columnCount: ws.columnCount
+    }));
+
+    const ws = templateWb.worksheets[0];
+    if (!ws) {
       return res.status(500).send("Feuille template introuvable.");
     }
 
-    const employees = extractEmployeesFromPlanningSimple(planningWs);
-    const summary = writeNavettePlain(templateWs, employees);
+    // Ecriture très visible
+    ws.getCell("A1").value = "TEST A1";
+    ws.getCell("A5").value = "TEST MAT";
+    ws.getCell("B5").value = "TEST NOM";
+    ws.getCell("C5").value = 999;
+    ws.getCell("D5").value = "J1";
+    ws.getCell("E5").value = "J3";
 
-    const debugInfo = {
-      employeesCount: employees.length,
-      firstEmployee: employees[0] || null,
-      summaryCount: summary.length,
-      firstSummary: summary[0] || null
-    };
+    ws.getCell("A6").value = "LIGNE 6";
+    ws.getCell("B6").value = "VISIBLE ?";
+    ws.getCell("C6").value = 123;
 
     const buffer = await templateWb.xlsx.writeBuffer();
 
@@ -121,15 +118,15 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     );
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${buildNavetteOutputName(req.file.originalname)}"`
-    );
-    res.setHeader(
-      "X-Results",
-      encodeURIComponent(JSON.stringify(summary.slice(0, 500)))
+      `attachment; filename="test_template_visible.xlsx"`
     );
     res.setHeader(
       "X-Debug-Navette",
-      encodeURIComponent(JSON.stringify(debugInfo))
+      encodeURIComponent(JSON.stringify({
+        ok: true,
+        sheets: debugSheets,
+        wrote: ["A1", "A5", "B5", "C5", "D5", "E5", "A6", "B6", "C6"]
+      }))
     );
 
     return res.send(Buffer.from(buffer));
@@ -146,10 +143,6 @@ app.listen(PORT, () => {
 
 function buildOutputName(name) {
   return String(name || "service_charge.xlsx").replace(/\.xlsx$/i, "") + "_traite.xlsx";
-}
-
-function buildNavetteOutputName(name) {
-  return String(name || "navette_paie.xlsx").replace(/\.xlsx$/i, "") + "_navette_paie.xlsx";
 }
 
 function resolveFirstWorksheetPath(workbookXml, relsXml) {
@@ -408,205 +401,4 @@ function decodeXml(str) {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
-}
-
-function cleanCellText(value) {
-  if (value == null) return "";
-  if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (typeof value === "object" && value.text) return String(value.text).trim();
-  if (typeof value === "object" && value.richText) {
-    return value.richText.map(x => x.text || "").join("").trim();
-  }
-  if (typeof value === "object" && value.result != null) {
-    return String(value.result).trim();
-  }
-  return String(value).trim();
-}
-
-function normalizeCode(value) {
-  return cleanCellText(value).replace(/\s+/g, " ").trim().toUpperCase();
-}
-
-function isTrackedCode(code) {
-  return code === "CA" || code === "MALADIE" || code === "AT" || code === "ABS";
-}
-
-function extractEmployeesFromPlanningSimple(ws) {
-  const employees = [];
-  const START_ROW = 13;
-  const START_COL = 3;
-  const END_COL = 32;
-
-  let rowNumber = START_ROW;
-
-  while (true) {
-    const row = ws.getRow(rowNumber);
-    const mat = cleanCellText(row.getCell(1).value);
-    const name = cleanCellText(row.getCell(2).value);
-
-    let allDaysEmpty = true;
-    for (let col = START_COL; col <= END_COL; col++) {
-      const v = cleanCellText(row.getCell(col).value);
-      if (v !== "") {
-        allDaysEmpty = false;
-        break;
-      }
-    }
-
-    if (mat === "" && name === "" && allDaysEmpty) {
-      break;
-    }
-
-    const blocks = [];
-    let current = null;
-
-    for (let col = START_COL; col <= END_COL; col++) {
-      const code = normalizeCode(row.getCell(col).value);
-      const dayIndex = col - START_COL + 1;
-
-      if (!isTrackedCode(code)) {
-        if (current) {
-          blocks.push(current);
-          current = null;
-        }
-        continue;
-      }
-
-      if (!current) {
-        current = {
-          type: code,
-          startDay: dayIndex,
-          endDay: dayIndex,
-          days: 1
-        };
-        continue;
-      }
-
-      if (current.type === code) {
-        current.endDay = dayIndex;
-        current.days += 1;
-      } else {
-        blocks.push(current);
-        current = {
-          type: code,
-          startDay: dayIndex,
-          endDay: dayIndex,
-          days: 1
-        };
-      }
-    }
-
-    if (current) {
-      blocks.push(current);
-    }
-
-    employees.push({
-      mat,
-      name,
-      blocks
-    });
-
-    rowNumber++;
-  }
-
-  return employees;
-}
-
-function writeNavettePlain(ws, employees) {
-  const START_ROW = 5;
-  const summary = [];
-
-  let rowIndex = START_ROW;
-  let totalCA = 0;
-  let totalMaladie = 0;
-  let totalAT = 0;
-  let totalABS = 0;
-
-  for (let r = START_ROW; r < START_ROW + 300; r++) {
-    for (let c = 1; c <= 20; c++) {
-      ws.getRow(r).getCell(c).value = null;
-    }
-  }
-
-  for (const employee of employees) {
-    const rows = packBlocksIntoRows(employee.blocks);
-    const usedRows = Math.max(1, rows.length);
-
-    for (let i = 0; i < usedRows; i++) {
-      const row = ws.getRow(rowIndex + i);
-      const packed = rows[i] || { CA: null, MALADIE: null, AT: null, ABS: null };
-
-      if (i === 0) {
-        row.getCell(1).value = employee.mat;
-        row.getCell(2).value = employee.name;
-      }
-
-      writeSimpleBlock(row, packed.CA, 3);
-      writeSimpleBlock(row, packed.MALADIE, 6);
-      writeSimpleBlock(row, packed.AT, 9);
-      writeSimpleBlock(row, packed.ABS, 12);
-
-      if (packed.CA) totalCA += packed.CA.days;
-      if (packed.MALADIE) totalMaladie += packed.MALADIE.days;
-      if (packed.AT) totalAT += packed.AT.days;
-      if (packed.ABS) totalABS += packed.ABS.days;
-
-      summary.push({
-        mat: employee.mat,
-        name: employee.name,
-        rowNumber: rowIndex + i,
-        conge: packed.CA ? `${packed.CA.days}j J${packed.CA.startDay} -> J${packed.CA.endDay}` : "",
-        maladie: packed.MALADIE ? `${packed.MALADIE.days}j J${packed.MALADIE.startDay} -> J${packed.MALADIE.endDay}` : "",
-        at: packed.AT ? `${packed.AT.days}j J${packed.AT.startDay} -> J${packed.AT.endDay}` : "",
-        abs: packed.ABS ? `${packed.ABS.days}j J${packed.ABS.startDay} -> J${packed.ABS.endDay}` : ""
-      });
-    }
-
-    rowIndex += usedRows;
-  }
-
-  ws.getRow(rowIndex + 1).getCell(3).value = totalCA;
-  ws.getRow(rowIndex + 1).getCell(6).value = totalMaladie;
-  ws.getRow(rowIndex + 1).getCell(9).value = totalAT;
-  ws.getRow(rowIndex + 1).getCell(12).value = totalABS;
-  ws.getRow(rowIndex + 1).getCell(15).value = 0;
-  ws.getRow(rowIndex + 1).getCell(19).value = 0;
-  ws.getRow(rowIndex + 1).getCell(20).value = 0;
-
-  ws.getRow(rowIndex + 3).getCell(2).value = "Préparé par :";
-  ws.getRow(rowIndex + 4).getCell(2).value = "Direction Ressources Humaines";
-  ws.getRow(rowIndex + 4).getCell(17).value = "Directeur Général";
-
-  return summary;
-}
-
-function packBlocksIntoRows(blocks) {
-  const rows = [];
-
-  for (const block of blocks) {
-    let placed = false;
-
-    for (const row of rows) {
-      if (!row[block.type]) {
-        row[block.type] = block;
-        placed = true;
-        break;
-      }
-    }
-
-    if (!placed) {
-      const newRow = { CA: null, MALADIE: null, AT: null, ABS: null };
-      newRow[block.type] = block;
-      rows.push(newRow);
-    }
-  }
-
-  return rows;
-}
-
-function writeSimpleBlock(row, block, startCol) {
-  if (!block) return;
-  row.getCell(startCol).value = block.days;
-  row.getCell(startCol + 1).value = `J${block.startDay}`;
-  row.getCell(startCol + 2).value = `J${block.endDay}`;
 }
