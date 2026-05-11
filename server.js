@@ -103,18 +103,8 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
       return res.status(500).send("Feuille template introuvable.");
     }
 
-    const extraction = extractEmployeesFromPlanning(planningWs);
-    const employees = extraction.employees;
+    const employees = extractEmployeesFromPlanning(planningWs);
     const summary = buildNavetteSheet(templateWs, employees);
-
-    const debugInfo = {
-      employeesCount: employees.length,
-      firstEmployee: employees[0] || null,
-      firstFiveEmployees: employees.slice(0, 5),
-      dateDebug: extraction.dateDebug,
-      firstRowsDebug: extraction.firstRowsDebug,
-      summaryPreview: summary.slice(0, 20)
-    };
 
     const buffer = await templateWb.xlsx.writeBuffer();
 
@@ -129,10 +119,6 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     res.setHeader(
       "X-Results",
       encodeURIComponent(JSON.stringify(summary.slice(0, 500)))
-    );
-    res.setHeader(
-      "X-Debug-Navette",
-      encodeURIComponent(JSON.stringify(debugInfo))
     );
 
     return res.send(Buffer.from(buffer));
@@ -419,22 +405,13 @@ function extractEmployeesFromPlanning(ws) {
   const DATE_START_COL = 3;
   const DATE_END_COL = 32;
 
-  const rawDateCells = [];
+  const dates = [];
   for (let col = DATE_START_COL; col <= DATE_END_COL; col++) {
-    rawDateCells.push(ws.getRow(11).getCell(col).value);
+    const raw = ws.getRow(11).getCell(col).value;
+    dates.push(normalizeExcelDate(raw));
   }
 
-  const year = detectYearFromDateRow(rawDateCells) || 2026;
-  const dates = rawDateCells.map(v => normalizePlanningHeaderDate(v, year));
-
-  const dateDebug = rawDateCells.map((v, i) => ({
-    col: DATE_START_COL + i,
-    raw: debugCellValue(v),
-    normalized: dates[i]
-  }));
-
   let rowNumber = START_ROW;
-  const firstRowsDebug = [];
 
   while (true) {
     const row = ws.getRow(rowNumber);
@@ -455,22 +432,13 @@ function extractEmployeesFromPlanning(ws) {
       break;
     }
 
-    const rowCodesDebug = [];
     const blocks = [];
     let current = null;
 
     for (let idx = 0; idx < dates.length; idx++) {
       const col = DATE_START_COL + idx;
-      const rawCell = row.getCell(col).value;
-      const code = normalizeCode(rawCell);
+      const code = normalizeCode(row.getCell(col).value);
       const date = dates[idx];
-
-      rowCodesDebug.push({
-        col,
-        raw: debugCellValue(rawCell),
-        code,
-        date
-      });
 
       if (!date || !isTrackedCode(code)) {
         if (current) {
@@ -508,60 +476,45 @@ function extractEmployeesFromPlanning(ws) {
       blocks.push(current);
     }
 
-    const employee = {
+    employees.push({
       mat,
       name,
       blocks: blocks.sort((a, b) => a.start.localeCompare(b.start))
-    };
-
-    employees.push(employee);
-
-    if (firstRowsDebug.length < 3) {
-      firstRowsDebug.push({
-        rowNumber,
-        mat,
-        name,
-        blocks: employee.blocks,
-        cells: rowCodesDebug
-      });
-    }
+    });
 
     rowNumber++;
   }
 
-  return { employees, dateDebug, firstRowsDebug };
+  return employees;
 }
 
 function buildNavetteSheet(ws, employees) {
   const START_ROW = 5;
   const summary = [];
 
-  unmergeDataArea(ws, START_ROW, 1000);
+  unmergeDataArea(ws, START_ROW, 400);
+  clearDataArea(ws, START_ROW, 400);
 
+  const styleSourceRow = ws.getRow(5);
+
+  let currentRow = START_ROW;
   let totalCA = 0;
   let totalMaladie = 0;
   let totalAT = 0;
   let totalABS = 0;
 
-  let currentRow = START_ROW;
-
   for (const employee of employees) {
     const packedRows = packBlocksIntoRows(employee.blocks);
     const rowCount = Math.max(1, packedRows.length);
 
-    if (currentRow > START_ROW) {
-      for (let i = 0; i < rowCount; i++) {
-        ws.insertRow(currentRow + i, []);
-        cloneRowStyleFromPrevious(ws, currentRow + i);
-      }
+    for (let i = 0; i < rowCount; i++) {
+      cloneRowStyle(ws, styleSourceRow, currentRow + i);
     }
 
     for (let i = 0; i < rowCount; i++) {
       const rowIndex = currentRow + i;
       const row = ws.getRow(rowIndex);
       const packed = packedRows[i] || { CA: null, MALADIE: null, AT: null, ABS: null };
-
-      clearRowValues(row, 1, 20);
 
       if (i === 0) {
         row.getCell(1).value = employee.mat;
@@ -597,9 +550,13 @@ function buildNavetteSheet(ws, employees) {
     currentRow += rowCount;
   }
 
-  const totalRow = currentRow;
-  const preparedRow = currentRow + 2;
-  const drhRow = currentRow + 3;
+  const totalRow = currentRow + 1;
+  const preparedRow = totalRow + 1;
+  const drhRow = totalRow + 2;
+
+  cloneRowStyle(ws, styleSourceRow, totalRow);
+  cloneRowStyle(ws, styleSourceRow, preparedRow);
+  cloneRowStyle(ws, styleSourceRow, drhRow);
 
   ws.getRow(totalRow).getCell(3).value = totalCA;
   ws.getRow(totalRow).getCell(6).value = totalMaladie;
@@ -651,14 +608,17 @@ function writeBlockToRow(row, block, startCol) {
   row.getCell(startCol + 2).value = formatDateFr(block.end);
 }
 
-function clearRowValues(row, startCol, endCol) {
-  for (let c = startCol; c <= endCol; c++) {
-    row.getCell(c).value = null;
+function clearDataArea(ws, startRow, maxRows) {
+  for (let r = startRow; r < startRow + maxRows; r++) {
+    const row = ws.getRow(r);
+    for (let c = 1; c <= 20; c++) {
+      row.getCell(c).value = null;
+    }
   }
 }
 
 function unmergeDataArea(ws, startRow, endRow) {
-  const merges = Array.from(ws._merges || []);
+  const merges = Array.from(ws._merges);
   for (const merge of merges) {
     const m = typeof merge === "string" ? merge : merge.range;
     const match = String(m).match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
@@ -675,10 +635,8 @@ function unmergeDataArea(ws, startRow, endRow) {
   }
 }
 
-function cloneRowStyleFromPrevious(ws, rowNumber) {
-  const sourceRow = ws.getRow(rowNumber - 1);
-  const targetRow = ws.getRow(rowNumber);
-
+function cloneRowStyle(ws, sourceRow, targetRowNumber) {
+  const targetRow = ws.getRow(targetRowNumber);
   targetRow.height = sourceRow.height;
 
   for (let c = 1; c <= 20; c++) {
@@ -689,67 +647,33 @@ function cloneRowStyleFromPrevious(ws, rowNumber) {
     if (sourceCell.numFmt) targetCell.numFmt = sourceCell.numFmt;
     if (sourceCell.alignment) targetCell.alignment = { ...sourceCell.alignment };
     if (sourceCell.font) targetCell.font = { ...sourceCell.font };
-    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border || {}));
-    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill || {}));
+    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border));
+    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill));
   }
 }
 
 function cleanCellText(value) {
   if (value == null) return "";
-
   if (value instanceof Date) return value.toISOString().slice(0, 10);
-
-  if (typeof value === "object") {
-    if (value.text != null) return String(value.text).trim();
-    if (Array.isArray(value.richText)) return value.richText.map(x => x.text || "").join("").trim();
-    if (value.result != null) return cleanCellText(value.result);
-    if (value.formula != null && value.result != null) return cleanCellText(value.result);
-    if (value.hyperlink && value.text) return String(value.text).trim();
+  if (typeof value === "object" && value.text) return String(value.text).trim();
+  if (typeof value === "object" && value.richText) {
+    return value.richText.map(x => x.text || "").join("").trim();
   }
-
+  if (typeof value === "object" && value.result != null) {
+    return String(value.result).trim();
+  }
   return String(value).trim();
 }
 
 function normalizeCode(value) {
-  return cleanCellText(value).replace(/\s+/g, " ").trim().toUpperCase();
+  return cleanCellText(value).toUpperCase();
 }
 
 function isTrackedCode(code) {
   return code === "CA" || code === "MALADIE" || code === "AT" || code === "ABS";
 }
 
-function detectYearFromDateRow(values) {
-  for (const v of values) {
-    const year = extractYearFromAnyDateValue(v);
-    if (year) return year;
-  }
-  return null;
-}
-
-function extractYearFromAnyDateValue(value) {
-  if (!value) return null;
-
-  if (value instanceof Date) return value.getFullYear();
-
-  if (typeof value === "object" && value.result instanceof Date) {
-    return value.result.getFullYear();
-  }
-
-  const s = cleanCellText(value);
-  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-  if (m) {
-    let y = m[3];
-    if (y.length === 2) y = "20" + y;
-    return parseInt(y, 10);
-  }
-
-  const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return d.getFullYear();
-
-  return null;
-}
-
-function normalizePlanningHeaderDate(value, fallbackYear) {
+function normalizeExcelDate(value) {
   if (!value) return null;
 
   if (value instanceof Date) {
@@ -760,22 +684,20 @@ function normalizePlanningHeaderDate(value, fallbackYear) {
     return value.result.toISOString().slice(0, 10);
   }
 
-  const s = cleanCellText(value);
-
-  let m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
-  if (m) {
-    const dd = m[1].padStart(2, "0");
-    const mm = m[2].padStart(2, "0");
-    let yyyy = m[3];
-    if (yyyy.length === 2) yyyy = "20" + yyyy;
-    return `${yyyy}-${mm}-${dd}`;
+  if (typeof value === "number") {
+    const excelEpoch = new Date(Date.UTC(1899, 11, 30));
+    const date = new Date(excelEpoch.getTime() + value * 86400000);
+    return date.toISOString().slice(0, 10);
   }
 
-  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+  const s = String(value).trim();
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
   if (m) {
     const dd = m[1].padStart(2, "0");
     const mm = m[2].padStart(2, "0");
-    return `${fallbackYear}-${mm}-${dd}`;
+    let yyyy = m[3] || "2026";
+    if (yyyy.length === 2) yyyy = "20" + yyyy;
+    return `${yyyy}-${mm}-${dd}`;
   }
 
   const d = new Date(s);
@@ -784,23 +706,6 @@ function normalizePlanningHeaderDate(value, fallbackYear) {
   }
 
   return null;
-}
-
-function debugCellValue(value) {
-  if (value == null) return null;
-  if (value instanceof Date) return { type: "Date", value: value.toISOString() };
-
-  if (typeof value === "object") {
-    const out = {};
-    for (const k of Object.keys(value)) {
-      const v = value[k];
-      if (v instanceof Date) out[k] = v.toISOString();
-      else out[k] = v;
-    }
-    return out;
-  }
-
-  return value;
 }
 
 function formatDateFr(isoDate) {
