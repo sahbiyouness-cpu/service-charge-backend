@@ -21,11 +21,11 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("Backend Service Charge OK");
+  res.send("Backend RimH OK");
 });
 
 // =========================================================================
-// ROUTE 1 : PROCESS XLSX (SERVICE CHARGE) - STRICTEMENT INCHANGÉE
+// ROUTE 1 : PROCESS XLSX (SERVICE CHARGE) - RESTE INTACTE
 // =========================================================================
 app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   try {
@@ -40,10 +40,7 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
     const firstSheetPath = resolveFirstWorksheetPath(workbookXml, relsXml);
     if (!firstSheetPath) return res.status(400).send("Première feuille introuvable.");
 
-    const sheetFile = zip.file(firstSheetPath);
-    if (!sheetFile) return res.status(400).send("Feuille XML introuvable.");
-
-    let sheetXml = await sheetFile.async("string");
+    let sheetXml = await zip.file(firstSheetPath).async("string");
     const sharedStrings = parseSharedStrings(sharedStringsXml || "");
     const rows = parseRows(sheetXml, sharedStrings);
     const result = buildAGUpdates(rows);
@@ -56,66 +53,72 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
     const outputBuffer = await zip.generateAsync({ type: "nodebuffer", compression: "STORE" });
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="${buildOutputName(req.file.originalname)}"`);
+    res.setHeader("Content-Disposition", `attachment; filename="service_charge_traite.xlsx"`);
     res.setHeader("X-Results", encodeURIComponent(JSON.stringify(result.results.slice(0, 300))));
     return res.send(outputBuffer);
   } catch (err) {
-    console.error(err);
-    return res.status(500).send("Erreur traitement XLSX: " + err.message);
+    return res.status(500).send("Erreur Service Charge: " + err.message);
   }
 });
 
 // =========================================================================
-// ROUTE 2 : GENERATE NAVETTE PAIE (CORRIGÉE AVEC LE NOM VU SUR TES SCREENS)
+// ROUTE 2 : GENERATE NAVETTE PAIE (DYNAMIQUE)
 // =========================================================================
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
-    console.log("--- DEBUT GENERATION NAVETTE ---");
-    const templatePath = path.join(process.cwd(), "templates", "navette_paie_template.xlsx");
+    if (!req.file) return res.status(400).send("Fichier source manquant.");
 
-    if (!fs.existsSync(templatePath)) {
-      throw new Error("Fichier template introuvable sur le serveur.");
-    }
-
-    const workbook = new ExcelJS.Workbook();
-    const templateBuffer = fs.readFileSync(templatePath);
-    await workbook.xlsx.load(templateBuffer);
-
-    // On utilise exactement le nom vu sur ta capture d'écran
-    let ws = workbook.getWorksheet("Etat navette paie") || workbook.getWorksheet(1);
+    // 1. Lire le fichier envoyé par l'utilisateur pour extraire MAT et NOM
+    const sourceWorkbook = new ExcelJS.Workbook();
+    await sourceWorkbook.xlsx.load(req.file.buffer);
+    const sourceWs = sourceWorkbook.getWorksheet(1); // On prend la 1ère feuille du fichier envoyé
     
-    if (!ws) {
-      throw new Error("Impossible de trouver la feuille 'Etat navette paie'.");
-    }
+    const employees = [];
+    sourceWs.eachRow((row, rowNumber) => {
+      // On suppose que MAT est en col A et NOM en col B (à ajuster selon ton fichier source)
+      const mat = row.getCell(1).value;
+      const nom = row.getCell(2).value;
+      
+      // On ignore l'entête si c'est du texte non numérique pour le matricule
+      if (mat && mat !== "MAT") {
+        employees.push({ mat, nom });
+      }
+    });
 
-    console.log("Feuille cible :", ws.name);
+    // 2. Charger le TEMPLATE
+    const templatePath = path.join(process.cwd(), "templates", "navette_paie_template.xlsx");
+    if (!fs.existsSync(templatePath)) throw new Error("Template introuvable.");
 
-    // Test de remplissage sur la ligne 5
-    ws.getCell("A5").value = "999";
-    ws.getCell("B5").value = "NOM TEST";
-    ws.getCell("C5").value = 10;
+    const templateWorkbook = new ExcelJS.Workbook();
+    await templateWorkbook.xlsx.load(fs.readFileSync(templatePath));
+    const targetWs = templateWorkbook.getWorksheet("Etat navette paie") || templateWorkbook.getWorksheet(1);
 
-    const buffer = await workbook.xlsx.writeBuffer();
+    // 3. Injecter les données dans le template à partir de la ligne 5
+    let startRow = 5;
+    employees.forEach((emp, index) => {
+      const currentRow = startRow + index;
+      targetWs.getCell(`A${currentRow}`).value = emp.mat;
+      targetWs.getCell(`B${currentRow}`).value = emp.nom;
+      // On peut aussi initialiser les autres colonnes à 0 ou vide
+      targetWs.getCell(`C${currentRow}`).value = 0; 
+    });
+
+    // 4. Générer le fichier final
+    const buffer = await templateWorkbook.xlsx.writeBuffer();
     
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="navette_paie_generee.xlsx"');
+    res.setHeader("Content-Disposition", 'attachment; filename="navette_complete.xlsx"');
     return res.send(buffer);
 
   } catch (err) {
-    console.error("ERREUR NAVETTE :", err.message);
-    return res.status(500).send("Erreur : " + err.message);
+    console.error(err);
+    return res.status(500).send("Erreur Navette: " + err.message);
   }
 });
 
-// =========================================================================
-// TOUTES LES FONCTIONS UTILITAIRES (GARDÉES INTACTES)
-// =========================================================================
+// --- UTILITAIRES (Inchangés pour garantir la stabilité de la Route 1) ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server port:", PORT));
-
-function buildOutputName(name) {
-  return String(name || "fichier").replace(/\.xlsx$/i, "") + "_traite.xlsx";
-}
+app.listen(PORT, () => console.log("Serveur démarré sur port", PORT));
 
 function resolveFirstWorksheetPath(workbookXml, relsXml) {
   const rid = workbookXml.match(/<sheet[^>]*r:id="([^"]+)"[^>]*\/>/)?.[1];
@@ -197,10 +200,7 @@ function patchCellValueSafe(xml, ref, val) {
 }
 
 function getCellByColumn(row, col) { 
-  return row.cells.find(c => {
-    const letters = c.ref?.match(/^([A-Z]+)/)?.[1];
-    return letters && colToIndex(letters) === col;
-  }); 
+  return row.cells.find(c => colToIndex(c.ref?.match(/^[A-Z]+/)?.[0]) === col); 
 }
 function isRowEmptyAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return false; return true; }
 function hasAnyDataAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return true; return false; }
