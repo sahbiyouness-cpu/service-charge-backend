@@ -106,6 +106,13 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     const employees = extractEmployeesFromPlanning(planningWs);
     const summary = buildNavetteSheet(templateWs, employees);
 
+    const debugInfo = {
+      employeesCount: employees.length,
+      firstEmployee: employees[0] || null,
+      summaryCount: summary.length,
+      firstSummary: summary[0] || null
+    };
+
     const buffer = await templateWb.xlsx.writeBuffer();
 
     res.setHeader(
@@ -119,6 +126,10 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     res.setHeader(
       "X-Results",
       encodeURIComponent(JSON.stringify(summary.slice(0, 500)))
+    );
+    res.setHeader(
+      "X-Debug-Navette",
+      encodeURIComponent(JSON.stringify(debugInfo))
     );
 
     return res.send(Buffer.from(buffer));
@@ -618,7 +629,7 @@ function clearDataArea(ws, startRow, maxRows) {
 }
 
 function unmergeDataArea(ws, startRow, endRow) {
-  const merges = Array.from(ws._merges);
+  const merges = Array.from(ws._merges || []);
   for (const merge of merges) {
     const m = typeof merge === "string" ? merge : merge.range;
     const match = String(m).match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/);
@@ -647,8 +658,8 @@ function cloneRowStyle(ws, sourceRow, targetRowNumber) {
     if (sourceCell.numFmt) targetCell.numFmt = sourceCell.numFmt;
     if (sourceCell.alignment) targetCell.alignment = { ...sourceCell.alignment };
     if (sourceCell.font) targetCell.font = { ...sourceCell.font };
-    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border));
-    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill));
+    if (sourceCell.border) targetCell.border = JSON.parse(JSON.stringify(sourceCell.border || {}));
+    if (sourceCell.fill) targetCell.fill = JSON.parse(JSON.stringify(sourceCell.fill || {}));
   }
 }
 
