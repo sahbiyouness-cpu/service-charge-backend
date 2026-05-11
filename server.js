@@ -1,8 +1,13 @@
 import express from "express";
 import multer from "multer";
 import JSZip from "jszip";
+import ExcelJS from "exceljs";
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -15,7 +20,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- ROUTE 1 : SERVICE CHARGE (Inchangée) ---
+app.get("/", (req, res) => {
+  res.send("Backend Service Charge OK");
+});
+
+// =========================================================================
+// ROUTE 1 : PROCESS XLSX (SERVICE CHARGE) - RECOPIÉ À L'IDENTIQUE
+// =========================================================================
 app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).send("Fichier manquant.");
@@ -24,9 +35,15 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
     const relsXml = await zip.file("xl/_rels/workbook.xml.rels")?.async("string");
     const sharedStringsXml = await zip.file("xl/sharedStrings.xml")?.async("string");
 
+    if (!workbookXml || !relsXml) return res.status(400).send("Fichier XLSX invalide.");
+
     const firstSheetPath = resolveFirstWorksheetPath(workbookXml, relsXml);
-    let sheetXml = await zip.file(firstSheetPath).async("string");
-    
+    if (!firstSheetPath) return res.status(400).send("Première feuille introuvable.");
+
+    const sheetFile = zip.file(firstSheetPath);
+    if (!sheetFile) return res.status(400).send("Feuille XML introuvable.");
+
+    let sheetXml = await sheetFile.async("string");
     const sharedStrings = parseSharedStrings(sharedStringsXml || "");
     const rows = parseRows(sheetXml, sharedStrings);
     const result = buildAGUpdates(rows);
@@ -36,106 +53,87 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
     }
 
     zip.file(firstSheetPath, sheetXml);
-    const outputBuffer = await zip.generateAsync({ type: "nodebuffer" });
+    const outputBuffer = await zip.generateAsync({ type: "nodebuffer", compression: "STORE" });
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${buildOutputName(req.file.originalname)}"`);
+    res.setHeader("X-Results", encodeURIComponent(JSON.stringify(result.results.slice(0, 300))));
     return res.send(outputBuffer);
   } catch (err) {
-    res.status(500).send(err.message);
+    console.error(err);
+    return res.status(500).send("Erreur traitement XLSX: " + err.message);
   }
 });
 
-// --- ROUTE 2 : NAVETTE PAIE (Version JSZip Ultra-Robuste) ---
+// =========================================================================
+// ROUTE 2 : GENERATE NAVETTE PAIE (CORRIGÉE AVEC LE BON NOM DE FEUILLE)
+// =========================================================================
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
-    console.log("--- DEBUT GENERATION NAVETTE (JSZip Mode) ---");
+    console.log("--- DEBUT GENERATION NAVETTE ---");
     const templatePath = path.join(process.cwd(), "templates", "navette_paie_template.xlsx");
 
     if (!fs.existsSync(templatePath)) {
-      throw new Error("Fichier template introuvable sur le disque.");
+      throw new Error("Fichier template introuvable sur le serveur Render.");
     }
 
-    // 1. Charger le template via JSZip
-    const templateData = fs.readFileSync(templatePath);
-    const zip = await JSZip.loadAsync(templateData);
+    const workbook = new ExcelJS.Workbook();
+    const templateBuffer = fs.readFileSync(templatePath);
+    await workbook.xlsx.load(templateBuffer);
 
-    // 2. Trouver la feuille JANVIER 2026 (via workbook.xml)
-    const workbookXml = await zip.file("xl/workbook.xml").async("string");
-    const relsXml = await zip.file("xl/_rels/workbook.xml.rels").async("string");
+    // CORRECTION : On utilise le nom exact vu dans ton CSV
+    let ws = workbook.getWorksheet("Etat navette paie") || workbook.getWorksheet(1);
     
-    // On cherche l'ID de la feuille qui s'appelle "JANVIER 2026"
-    const sheetMatch = workbookXml.match(/<sheet [^>]*name="JANVIER 2026"[^>]*r:id="([^"]+)"/i) 
-                    || workbookXml.match(/<sheet [^>]*r:id="([^"]+)"[^>]*name="JANVIER 2026"/i);
-    
-    let sheetPath = "";
-    if (sheetMatch) {
-      const rId = sheetMatch[1];
-      const relRegex = new RegExp(`Relationship [^>]*Id="${rId}" [^>]*Target="([^"]+)"`);
-      const relMatch = relsXml.match(relRegex);
-      if (relMatch) {
-        sheetPath = "xl/" + relMatch[1].replace("../", "");
-      }
-    } else {
-      // Si pas trouvé par nom, on prend la première feuille par défaut
-      sheetPath = resolveFirstWorksheetPath(workbookXml, relsXml);
+    if (!ws) {
+      throw new Error("Impossible de trouver la feuille 'Etat navette paie' dans le template.");
     }
 
-    console.log("Cible détectée :", sheetPath);
+    console.log("Feuille cible identifiée :", ws.name);
 
-    let sheetXml = await zip.file(sheetPath).async("string");
+    // Remplissage test sur la ligne 5 (MAT, NOM, CP)
+    ws.getCell("A5").value = "999";
+    ws.getCell("B5").value = "NOM DE TEST";
+    ws.getCell("C5").value = 15; // NB JR Congé
 
-    // 3. Injection directe des données (comme dans ton autre route)
-    // A5 = MAT, B5 = NOM, C5 = CP
-    sheetXml = patchCellValueSafe(sheetXml, "A5", "999");
-    sheetXml = patchCellValueSafe(sheetXml, "B5", "INJECTION JSZIP OK");
-    sheetXml = patchCellValueSafe(sheetXml, "C5", "10");
-
-    // 4. Reconstruction du fichier
-    zip.file(sheetPath, sheetXml);
-    const outputBuffer = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-
-    console.log("Succès : Fichier généré via JSZip");
+    const buffer = await workbook.xlsx.writeBuffer();
+    console.log("Buffer généré avec succès, taille :", buffer.byteLength);
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="navette_paie.xlsx"');
-    return res.send(outputBuffer);
+    res.setHeader("Content-Disposition", 'attachment; filename="navette_paie_generee.xlsx"');
+    return res.send(buffer);
 
   } catch (err) {
-    console.error("ERREUR :", err.message);
+    console.error("ERREUR NAVETTE :", err.message);
     return res.status(500).send("Erreur : " + err.message);
   }
 });
 
+// =========================================================================
+// FONCTIONS UTILITAIRES (GARDÉES INTACTES)
+// =========================================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server port:", PORT));
+app.listen(PORT, () => console.log("Serveur démarré sur le port", PORT));
 
-// --- UTILITAIRES RECOPIÉS ---
+function buildOutputName(name) {
+  return String(name || "fichier").replace(/\.xlsx$/i, "") + "_traite.xlsx";
+}
+
 function resolveFirstWorksheetPath(workbookXml, relsXml) {
   const rid = workbookXml.match(/<sheet[^>]*r:id="([^"]+)"[^>]*\/>/)?.[1];
   const relMatch = relsXml.match(new RegExp(`<Relationship[^>]*Id="${rid}"[^>]*Target="([^"]+)"[^>]*/>`));
-  let t = relMatch[1].replace(/^\/+/, "");
-  return t.startsWith("xl/") ? t : "xl/" + t;
+  if (!relMatch) return null;
+  let target = relMatch[1].replace(/^\/+/, "");
+  if (!target.startsWith("xl/")) target = "xl/" + target.replace(/^\.?\//, "");
+  return target;
 }
-function patchCellValueSafe(xml, ref, val) {
-  const rowNum = ref.match(/\d+$/)?.[0];
-  const rowReg = new RegExp(`(<row\\b[^>]*\\br="${rowNum}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
-  const m = xml.match(rowReg);
-  if (!m) return xml;
-  const cReg = new RegExp(`<c([^>]*\\br="${ref}"[^>]*)>([\\s\\S]*?)<\\/c>|<c([^>]*\\br="${ref}"[^>]*)\\/>`);
-  let inner = m[2];
-  // Si c'est un nombre, on ne met pas t="s", si c'est du texte, idéalement il faudrait sharedStrings, 
-  // mais pour un test, on peut injecter en mode 'inlineStr' ou forcer la valeur
-  const newVal = `<c r="${ref}"><v>${val}</v></c>`; 
-  if (cReg.test(inner)) inner = inner.replace(cReg, newVal);
-  else inner += newVal;
-  return xml.replace(rowReg, `${m[1]}${inner}${m[3]}`);
-}
+
 function parseSharedStrings(xml) {
   if (!xml) return [];
   return (xml.match(/<si[\s\S]*?<\/si>/g) || []).map(si => {
-    return [...si.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(m => m[1]).join("");
+    return [...si.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map(m => decodeXml(m[1])).join("");
   });
 }
+
 function parseRows(sheetXml, sharedStrings) {
   const rows = [];
   const rowRegex = /<row\b([^>]*)>([\s\S]*?)<\/row>/g;
@@ -148,11 +146,66 @@ function parseRows(sheetXml, sharedStrings) {
     while ((cm = cRegex.exec(m[2])) !== null) {
       const attrs = cm[1] || cm[3] || "";
       const valMatch = (cm[2] || "").match(/<v>([\s\S]*?)<\/v>/);
+      const typeMatch = attrs.match(/\bt="s"/);
       let val = valMatch ? valMatch[1] : "";
+      if (typeMatch) val = sharedStrings[parseInt(val, 10)] ?? "";
       cells.push({ ref: attrs.match(/\br="([A-Z]+[0-9]+)"/)?.[1], value: val });
     }
     rows.push({ rowNumber: rowNum ? parseInt(rowNum, 10) : null, cells });
   }
   return rows;
 }
-function buildAGUpdates(rows) { return { updates: [], results: [] }; } // Simplifié pour l'exemple
+
+function buildAGUpdates(rows) {
+  const updates = [], results = [];
+  let block = 1, i = 0;
+  while (i < rows.length) {
+    let marker = -1;
+    for (; i < rows.length; i++) {
+      if (!isEmptyValue(getCellByColumn(rows[i], 33)?.value)) { marker = i; break; }
+    }
+    if (marker === -1) break;
+    i = marker + 1;
+    let count = 0;
+    while (i < rows.length) {
+      if (isRowEmptyAtoAF(rows[i])) break;
+      if (hasAnyDataAtoAF(rows[i])) {
+        let total = 0;
+        for (let c = 3; c <= 32; c++) if (matchesWorkedValue(getCellByColumn(rows[i], c)?.value)) total++;
+        updates.push({ cellRef: `AG${rows[i].rowNumber}`, value: total });
+        results.push({ section: `BLOC ${block}`, rowNumber: rows[i].rowNumber, name: getCellByColumn(rows[i], 2)?.value, total });
+        count++;
+      }
+      i++;
+    }
+    if (count > 0) block++;
+    i++;
+  }
+  return { updates, results };
+}
+
+function patchCellValueSafe(xml, ref, val) {
+  const rowNum = ref.match(/\d+$/)?.[0];
+  const rowReg = new RegExp(`(<row\\b[^>]*\\br="${rowNum}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
+  const m = xml.match(rowReg);
+  if (!m) return xml;
+  const cReg = new RegExp(`<c([^>]*\\br="${ref}"[^>]*)>([\\s\\S]*?)<\\/c>|<c([^>]*\\br="${ref}"[^>]*)\\/>`);
+  let inner = m[2];
+  const newVal = `<c r="${ref}"><v>${val}</v></c>`;
+  if (cReg.test(inner)) inner = inner.replace(cReg, newVal);
+  else inner += newVal;
+  return xml.replace(rowReg, `${m[1]}${inner}${m[3]}`);
+}
+
+function getCellByColumn(row, col) { return row.cells.find(c => colToIndex(c.ref?.match(/^[A-Z]+/)?.[0]) === col); }
+function isRowEmptyAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return false; return true; }
+function hasAnyDataAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return true; return false; }
+function matchesWorkedValue(v) { const s = String(v || "").trim().toLowerCase(); return s === "1" || s === "mission"; }
+function isEmptyValue(v) { return !v || String(v).trim() === ""; }
+function colToIndex(c) { 
+  if(!c) return 0;
+  let n = 0; 
+  for (let i = 0; i < c.length; i++) n = n * 26 + (c.charCodeAt(i) - 64); 
+  return n; 
+}
+function decodeXml(s) { return String(s).replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'"); }
