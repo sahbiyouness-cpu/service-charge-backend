@@ -11,19 +11,12 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Debug : Liste les fichiers pour vérifier la présence du template
-console.log("Fichiers au démarrage :", fs.readdirSync(__dirname));
-
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
-});
-
-app.get("/", (req, res) => {
-  res.send("Backend Navette Paie OK");
 });
 
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
@@ -36,52 +29,69 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
 
     const workbookDest = new ExcelJS.Workbook();
     const templatePath = path.join(__dirname, "navette_paie_template.xlsx");
-
-    if (!fs.existsSync(templatePath)) {
-      return res.status(500).send(`Erreur : Le fichier template est introuvable.`);
-    }
-
+    if (!fs.existsSync(templatePath)) return res.status(500).send("Template introuvable.");
+    
     await workbookDest.xlsx.readFile(templatePath);
     const sheetDest = workbookDest.getWorksheet("Etat navette paie") || workbookDest.worksheets[0];
 
+    // 1. Récupérer les dates de la ligne 11 (Colonnes C à AF)
+    const datesMap = {};
+    const headerRow = sheetSource.getRow(11);
+    for (let col = 3; col <= 32; col++) {
+      let dateVal = headerRow.getCell(col).value;
+      // On garde uniquement le jour si c'est une date, sinon la valeur brute
+      datesMap[col] = dateVal instanceof Date ? dateVal.getDate() : dateVal;
+    }
+
     const startRowSource = 13;
-    const startRowDest = 5;
-    let currentDestRow = startRowDest;
+    let currentDestRow = 5;
 
     sheetSource.eachRow((row, rowNumber) => {
       if (rowNumber < startRowSource) return;
 
-      // Récupération du matricule brut pour garder le format d'origine
-      const matriculeCell = row.getCell(1);
-      const matricule = matriculeCell.value;
+      const matricule = row.getCell(1).value;
       const nom = row.getCell(2).value;
-
       if (!matricule) return;
 
-      const absences = extractAbsences(row);
-      const destRow = sheetDest.getRow(currentDestRow);
+      // 2. Extraire toutes les séquences d'absences (gère les coupures)
+      const allSequences = extractAllSequences(row, datesMap);
 
-      // Copie du matricule tel quel
-      destRow.getCell(1).value = matricule;
-      destRow.getCell(2).value = nom;
+      if (allSequences.length === 0) {
+        // Optionnel : Ajouter l'employé même sans absence ? 
+        // Ici on l'ajoute pour qu'il figure dans la liste
+        const destRow = sheetDest.getRow(currentDestRow);
+        destRow.getCell(1).value = matricule;
+        destRow.getCell(2).value = nom;
+        currentDestRow++;
+      } else {
+        const firstRowIndex = currentDestRow;
+        
+        allSequences.forEach((seq, index) => {
+          const destRow = sheetDest.getRow(currentDestRow);
+          destRow.getCell(1).value = matricule;
+          destRow.getCell(2).value = nom;
 
-      // Fonction pour écrire sans le zéro devant (cast en Number)
-      const writeData = (type, colStart) => {
-        if (absences[type]) {
-          destRow.getCell(colStart).value = Number(absences[type].total);     // NB JR
-          destRow.getCell(colStart + 1).value = Number(absences[type].start); // DU
-          destRow.getCell(colStart + 2).value = Number(absences[type].end);   // AU
+          // Mapping des colonnes (C=3, F=6, I=9, L=12)
+          const colMap = { 'CA': 3, 'MALADIE': 6, 'AT': 9, 'ABS': 12 };
+          const startCol = colMap[seq.type];
+
+          if (startCol) {
+            destRow.getCell(startCol).value = Number(seq.count);
+            destRow.getCell(startCol + 1).value = Number(seq.startDay);
+            destRow.getCell(startCol + 2).value = Number(seq.endDay);
+          }
+          currentDestRow++;
+        });
+
+        // 3. Fusionner Matricule et Nom si plusieurs lignes
+        if (allSequences.length > 1) {
+          sheetDest.mergeCells(firstRowIndex, 1, currentDestRow - 1, 1);
+          sheetDest.mergeCells(firstRowIndex, 2, currentDestRow - 1, 2);
+          // Centrage vertical de la fusion
+          sheetDest.getRow(firstRowIndex).getCell(1).alignment = { vertical: 'middle', horizontal: 'left' };
+          sheetDest.getRow(firstRowIndex).getCell(2).alignment = { vertical: 'middle', horizontal: 'left' };
         }
-      };
-
-      // Colonnes selon vos spécifications :
-      writeData('CA', 3);       // C, D, E
-      writeData('MALADIE', 6);  // F, G, H
-      writeData('AT', 9);       // I, J, K
-      writeData('ABS', 12);     // L, M, N
-
-      destRow.commit();
-      currentDestRow++;
+      }
     });
 
     const buffer = await workbookDest.xlsx.writeBuffer();
@@ -90,33 +100,46 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     return res.send(buffer);
 
   } catch (err) {
-    console.error(err);
     res.status(500).send("Erreur : " + err.message);
   }
 });
 
-function extractAbsences(row) {
-  const res = {};
-  const map = { 'CA': 'CA', 'MALADIE': 'MALADIE', 'AT': 'AT', 'ABS': 'ABS' };
+/**
+ * Détecte les séquences consécutives par type d'absence
+ */
+function extractAllSequences(row, datesMap) {
+  const sequences = [];
+  const codes = ['CA', 'MALADIE', 'AT', 'ABS'];
   
-  // Lecture de C(3) à AF(32)
+  let currentSeq = null;
+
   for (let col = 3; col <= 32; col++) {
     let val = row.getCell(col).value;
-    if (!val) continue;
-    
-    val = String(val).trim().toUpperCase();
+    val = val ? String(val).trim().toUpperCase() : null;
 
-    if (map[val]) {
-      const day = col - 2;
-      if (!res[val]) {
-        res[val] = { total: 0, start: day, end: day };
+    if (codes.includes(val)) {
+      const day = datesMap[col];
+      
+      if (currentSeq && currentSeq.type === val) {
+        // On continue la séquence
+        currentSeq.count++;
+        currentSeq.endDay = day;
+      } else {
+        // Nouvelle séquence détectée
+        if (currentSeq) sequences.push(currentSeq);
+        currentSeq = { type: val, startDay: day, endDay: day, count: 1 };
       }
-      res[val].total++;
-      res[val].end = day; 
+    } else {
+      // Rupture (travail ou autre code)
+      if (currentSeq) {
+        sequences.push(currentSeq);
+        currentSeq = null;
+      }
     }
   }
-  return res;
+  if (currentSeq) sequences.push(currentSeq);
+  return sequences;
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Serveur sur port ${PORT}`));
+app.listen(PORT, () => console.log(`Serveur prêt sur port ${PORT}`));
