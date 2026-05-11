@@ -21,11 +21,11 @@ app.use((req, res, next) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("Backend RimH OK");
+  res.send("Backend RimH - Service Charge & Navette OK");
 });
 
 // =========================================================================
-// ROUTE 1 : PROCESS XLSX (SERVICE CHARGE) - RESTE INTACTE
+// ROUTE 1 : PROCESS XLSX (SERVICE CHARGE) - TON CODE D'ORIGINE INTACT
 // =========================================================================
 app.post("/process-xlsx", upload.single("file"), async (req, res) => {
   try {
@@ -57,68 +57,80 @@ app.post("/process-xlsx", upload.single("file"), async (req, res) => {
     res.setHeader("X-Results", encodeURIComponent(JSON.stringify(result.results.slice(0, 300))));
     return res.send(outputBuffer);
   } catch (err) {
+    console.error(err);
     return res.status(500).send("Erreur Service Charge: " + err.message);
   }
 });
 
 // =========================================================================
-// ROUTE 2 : GENERATE NAVETTE PAIE (DYNAMIQUE)
+// ROUTE 2 : GENERATE NAVETTE PAIE (LOGIQUE RÉELLE DE TRANSFERT)
 // =========================================================================
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).send("Fichier source manquant.");
 
-    // 1. Lire le fichier envoyé par l'utilisateur pour extraire MAT et NOM
+    // 1. Lire le fichier source (ton tableau avec MAT et NOM)
     const sourceWorkbook = new ExcelJS.Workbook();
     await sourceWorkbook.xlsx.load(req.file.buffer);
-    const sourceWs = sourceWorkbook.getWorksheet(1); // On prend la 1ère feuille du fichier envoyé
+    const sourceWs = sourceWorkbook.getWorksheet(1);
     
-    const employees = [];
+    const employeeData = [];
+
+    // On parcourt le fichier source pour extraire les données
     sourceWs.eachRow((row, rowNumber) => {
-      // On suppose que MAT est en col A et NOM en col B (à ajuster selon ton fichier source)
-      const mat = row.getCell(1).value;
-      const nom = row.getCell(2).value;
+      const mat = row.getCell(1).value; // Colonne A: Matricule
+      const nom = row.getCell(2).value; // Colonne B: Nom
       
-      // On ignore l'entête si c'est du texte non numérique pour le matricule
-      if (mat && mat !== "MAT") {
-        employees.push({ mat, nom });
+      if (mat && !isNaN(mat)) { // On s'assure que c'est une ligne de données (matricule numérique)
+        let totalJours = 0;
+        // On compte les présences (colonnes 3 à 32 comme pour ton service charge)
+        for (let col = 3; col <= 32; col++) {
+          const val = row.getCell(col).value;
+          if (matchesWorkedValue(val)) {
+            totalJours++;
+          }
+        }
+        employeeData.push({ mat, nom, total: totalJours });
       }
     });
 
-    // 2. Charger le TEMPLATE
+    // 2. Charger le template Navette
     const templatePath = path.join(process.cwd(), "templates", "navette_paie_template.xlsx");
-    if (!fs.existsSync(templatePath)) throw new Error("Template introuvable.");
+    if (!fs.existsSync(templatePath)) throw new Error("Template non trouvé sur le serveur.");
 
     const templateWorkbook = new ExcelJS.Workbook();
     await templateWorkbook.xlsx.load(fs.readFileSync(templatePath));
     const targetWs = templateWorkbook.getWorksheet("Etat navette paie") || templateWorkbook.getWorksheet(1);
 
-    // 3. Injecter les données dans le template à partir de la ligne 5
-    let startRow = 5;
-    employees.forEach((emp, index) => {
-      const currentRow = startRow + index;
-      targetWs.getCell(`A${currentRow}`).value = emp.mat;
-      targetWs.getCell(`B${currentRow}`).value = emp.nom;
-      // On peut aussi initialiser les autres colonnes à 0 ou vide
-      targetWs.getCell(`C${currentRow}`).value = 0; 
+    // 3. Remplissage dynamique à partir de la ligne 5
+    employeeData.forEach((emp, index) => {
+      const targetRow = 5 + index;
+      targetWs.getCell(`A${targetRow}`).value = emp.mat;
+      targetWs.getCell(`B${targetRow}`).value = emp.nom;
+      
+      // On met le total calculé dans la colonne "Congé Payé / NB JR" (Colonne C)
+      // Note : Tu pourras adapter ici si ce total doit aller ailleurs
+      targetWs.getCell(`C${targetRow}`).value = emp.total;
     });
 
-    // 4. Générer le fichier final
+    // 4. Exportation
     const buffer = await templateWorkbook.xlsx.writeBuffer();
     
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="navette_complete.xlsx"');
+    res.setHeader("Content-Disposition", 'attachment; filename="navette_paie_complete.xlsx"');
     return res.send(buffer);
 
   } catch (err) {
-    console.error(err);
-    return res.status(500).send("Erreur Navette: " + err.message);
+    console.error("Erreur Navette:", err);
+    return res.status(500).send("Erreur lors de la génération: " + err.message);
   }
 });
 
-// --- UTILITAIRES (Inchangés pour garantir la stabilité de la Route 1) ---
+// =========================================================================
+// UTILITAIRES (GARDÉS POUR LE SERVICE CHARGE ET LA NAVETTE)
+// =========================================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Serveur démarré sur port", PORT));
+app.listen(PORT, () => console.log("Serveur actif sur port", PORT));
 
 function resolveFirstWorksheetPath(workbookXml, relsXml) {
   const rid = workbookXml.match(/<sheet[^>]*r:id="([^"]+)"[^>]*\/>/)?.[1];
@@ -200,13 +212,20 @@ function patchCellValueSafe(xml, ref, val) {
 }
 
 function getCellByColumn(row, col) { 
-  return row.cells.find(c => colToIndex(c.ref?.match(/^[A-Z]+/)?.[0]) === col); 
+  return row.cells.find(c => {
+    const letters = c.ref?.match(/^[A-Z]+/)?.[0];
+    return colToIndex(letters) === col;
+  });
 }
 function isRowEmptyAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return false; return true; }
 function hasAnyDataAtoAF(row) { for (let c = 1; c <= 32; c++) if (!isEmptyValue(getCellByColumn(row, c)?.value)) return true; return false; }
-function matchesWorkedValue(v) { const s = String(v || "").trim().toLowerCase(); return s === "1" || s === "mission"; }
+function matchesWorkedValue(v) { 
+  const s = String(v || "").trim().toLowerCase(); 
+  return s === "1" || s === "mission"; 
+}
 function isEmptyValue(v) { return !v || String(v).trim() === ""; }
 function colToIndex(c) { 
+  if(!c) return 0;
   let n = 0; 
   for (let i = 0; i < c.length; i++) n = n * 26 + (c.charCodeAt(i) - 64); 
   return n; 
