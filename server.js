@@ -32,7 +32,6 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     await workbookDest.xlsx.readFile(templatePath);
     const sheetDest = workbookDest.getWorksheet("Etat navette paie") || workbookDest.worksheets[0];
 
-    // 1. Récupération des dates (Ligne 11)
     const datesMap = {};
     const row11 = sheetSource.getRow(11);
     for (let col = 3; col <= 32; col++) {
@@ -42,11 +41,11 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     const startRowSource = 13;
     let currentDestRow = 5;
 
-    // Initialisation des compteurs pour les totaux
-    let totalCA = 0;
-    let totalMaladie = 0;
-    let totalAT = 0;
-    let totalAbs = 0;
+    // Variables pour les sommes
+    let sumCA = 0;
+    let sumMaladie = 0;
+    let sumAT = 0;
+    let sumAbs = 0;
 
     sheetSource.eachRow((row, rowNumber) => {
       if (rowNumber < startRowSource) return;
@@ -60,12 +59,10 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
       const fillRow = (m, n, seq = null) => {
         const destRow = sheetDest.getRow(currentDestRow);
         
-        // MATRICULE : Format Texte
         const cellMat = destRow.getCell(1);
         cellMat.value = m.toString();
         cellMat.numFmt = '@';
 
-        // NOM
         destRow.getCell(2).value = n;
 
         if (seq) {
@@ -73,20 +70,18 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
           const startCol = colMap[seq.type];
 
           if (startCol) {
-            const nbJours = Number(seq.count);
+            const count = Number(seq.count);
             
-            // Ajout au total correspondant
-            if (seq.type === 'CA') totalCA += nbJours;
-            if (seq.type === 'MALADIE') totalMaladie += nbJours;
-            if (seq.type === 'AT') totalAT += nbJours;
-            if (seq.type === 'ABS') totalAbs += nbJours;
+            // Calcul des sommes
+            if (seq.type === 'CA') sumCA += count;
+            if (seq.type === 'MALADIE') sumMaladie += count;
+            if (seq.type === 'AT') sumAT += count;
+            if (seq.type === 'ABS') sumAbs += count;
 
-            // NB JR : Format Nombre
             const cellNb = destRow.getCell(startCol);
-            cellNb.value = nbJours;
+            cellNb.value = count;
             cellNb.numFmt = '0';
 
-            // DU / AU : Format Date
             const cellDu = destRow.getCell(startCol + 1);
             const cellAu = destRow.getCell(startCol + 2);
             cellDu.value = seq.start instanceof Date ? seq.start : new Date(seq.start);
@@ -113,28 +108,19 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
       }
     });
 
-    // --- AJOUT DE LA LIGNE DES TOTAUX ---
-    // On ajoute une ligne de battement pour la clarté si nécessaire, ou on colle à la suite
-    const footerRow = sheetDest.getRow(currentDestRow);
+    // --- INSERTION DES SOMMES À LA LIGNE 62 ---
+    const row62 = sheetDest.getRow(62);
     
-    footerRow.getCell(2).value = "TOTAL GÉNÉRAL";
-    footerRow.getCell(2).font = { bold: true };
+    // Colonne 3 (CA), 6 (Maladie), 9 (AT), 12 (Absence)
+    row62.getCell(3).value = sumCA;
+    row62.getCell(6).value = sumMaladie;
+    row62.getCell(9).value = sumAT;
+    row62.getCell(12).value = sumAbs;
 
-    // Injection des sommes calculées
-    const totalsMapping = [
-      { col: 3, val: totalCA },
-      { col: 6, val: totalMaladie },
-      { col: 9, val: totalAT },
-      { col: 12, val: totalAbs }
-    ];
-
-    totalsMapping.forEach(item => {
-      const cell = footerRow.getCell(item.col);
-      cell.value = item.val;
-      cell.numFmt = '0';
-      cell.font = { bold: true };
-      // Optionnel : ajout d'une bordure supérieure pour marquer la fin du tableau
-      cell.border = { top: { style: 'thin' } };
+    // Application du format nombre sans gras
+    [3, 6, 9, 12].forEach(col => {
+      row62.getCell(col).numFmt = '0';
+      row62.getCell(col).font = { bold: false }; 
     });
 
     const buffer = await workbookDest.xlsx.writeBuffer();
