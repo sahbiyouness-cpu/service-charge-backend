@@ -42,6 +42,12 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     const startRowSource = 13;
     let currentDestRow = 5;
 
+    // Initialisation des compteurs pour les totaux
+    let totalCA = 0;
+    let totalMaladie = 0;
+    let totalAT = 0;
+    let totalAbs = 0;
+
     sheetSource.eachRow((row, rowNumber) => {
       if (rowNumber < startRowSource) return;
 
@@ -51,14 +57,13 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
 
       const sequences = extractSequences(row, datesMap);
 
-      // Fonction interne pour remplir une ligne avec le bon formatage
       const fillRow = (m, n, seq = null) => {
         const destRow = sheetDest.getRow(currentDestRow);
         
-        // MATRICULE : On le met en texte pour éviter toute conversion bizarre
+        // MATRICULE : Format Texte
         const cellMat = destRow.getCell(1);
         cellMat.value = m.toString();
-        cellMat.numFmt = '@'; // Format Texte
+        cellMat.numFmt = '@';
 
         // NOM
         destRow.getCell(2).value = n;
@@ -68,19 +73,24 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
           const startCol = colMap[seq.type];
 
           if (startCol) {
-            // NB JR : Nombre pur
+            const nbJours = Number(seq.count);
+            
+            // Ajout au total correspondant
+            if (seq.type === 'CA') totalCA += nbJours;
+            if (seq.type === 'MALADIE') totalMaladie += nbJours;
+            if (seq.type === 'AT') totalAT += nbJours;
+            if (seq.type === 'ABS') totalAbs += nbJours;
+
+            // NB JR : Format Nombre
             const cellNb = destRow.getCell(startCol);
-            cellNb.value = Number(seq.count);
+            cellNb.value = nbJours;
             cellNb.numFmt = '0';
 
-            // DU / AU : On force le format Date DD/MM/YYYY
+            // DU / AU : Format Date
             const cellDu = destRow.getCell(startCol + 1);
             const cellAu = destRow.getCell(startCol + 2);
-            
-            // On s'assure que la valeur est bien traitée comme une date par Excel
             cellDu.value = seq.start instanceof Date ? seq.start : new Date(seq.start);
             cellAu.value = seq.end instanceof Date ? seq.end : new Date(seq.end);
-            
             cellDu.numFmt = 'dd/mm/yyyy';
             cellAu.numFmt = 'dd/mm/yyyy';
           }
@@ -101,6 +111,30 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
           sheetDest.getRow(firstRowIndex).getCell(2).alignment = { vertical: 'middle', horizontal: 'left' };
         }
       }
+    });
+
+    // --- AJOUT DE LA LIGNE DES TOTAUX ---
+    // On ajoute une ligne de battement pour la clarté si nécessaire, ou on colle à la suite
+    const footerRow = sheetDest.getRow(currentDestRow);
+    
+    footerRow.getCell(2).value = "TOTAL GÉNÉRAL";
+    footerRow.getCell(2).font = { bold: true };
+
+    // Injection des sommes calculées
+    const totalsMapping = [
+      { col: 3, val: totalCA },
+      { col: 6, val: totalMaladie },
+      { col: 9, val: totalAT },
+      { col: 12, val: totalAbs }
+    ];
+
+    totalsMapping.forEach(item => {
+      const cell = footerRow.getCell(item.col);
+      cell.value = item.val;
+      cell.numFmt = '0';
+      cell.font = { bold: true };
+      // Optionnel : ajout d'une bordure supérieure pour marquer la fin du tableau
+      cell.border = { top: { style: 'thin' } };
     });
 
     const buffer = await workbookDest.xlsx.writeBuffer();
