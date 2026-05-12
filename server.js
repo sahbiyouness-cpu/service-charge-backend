@@ -32,7 +32,7 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     await workbookDest.xlsx.readFile(templatePath);
     const sheetDest = workbookDest.getWorksheet("Etat navette paie") || workbookDest.worksheets[0];
 
-    // 1. Récupération des dates réelles (Ligne 11)
+    // 1. Récupération des dates (Ligne 11)
     const datesMap = {};
     const row11 = sheetSource.getRow(11);
     for (let col = 3; col <= 32; col++) {
@@ -51,64 +51,61 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
 
       const sequences = extractSequences(row, datesMap);
 
-      // Si aucune absence, on liste quand même l'employé
-      if (sequences.length === 0) {
+      // Fonction interne pour remplir une ligne avec le bon formatage
+      const fillRow = (m, n, seq = null) => {
         const destRow = sheetDest.getRow(currentDestRow);
         
-        // Force le matricule en format nombre pour éviter l'affichage "date"
+        // MATRICULE : On le met en texte pour éviter toute conversion bizarre
         const cellMat = destRow.getCell(1);
-        cellMat.value = Number(matriculeRaw);
-        cellMat.numFmt = '0'; 
-        
-        destRow.getCell(2).value = nom;
-        currentDestRow++;
-      } else {
-        const firstRowIndex = currentDestRow;
+        cellMat.value = m.toString();
+        cellMat.numFmt = '@'; // Format Texte
 
-        sequences.forEach((seq) => {
-          const destRow = sheetDest.getRow(currentDestRow);
-          
-          // Matricule forcé en nombre
-          const cellMat = destRow.getCell(1);
-          cellMat.value = Number(matriculeRaw);
-          cellMat.numFmt = '0';
+        // NOM
+        destRow.getCell(2).value = n;
 
-          destRow.getCell(2).value = nom;
-
+        if (seq) {
           const colMap = { 'CA': 3, 'MALADIE': 6, 'AT': 9, 'ABS': 12 };
           const startCol = colMap[seq.type];
 
           if (startCol) {
-            // NOMBRE DE JOURS : Forcé en nombre standard (ex: 2 au lieu de 02/01/1900)
+            // NB JR : Nombre pur
             const cellNb = destRow.getCell(startCol);
             cellNb.value = Number(seq.count);
-            cellNb.numFmt = '0'; 
+            cellNb.numFmt = '0';
 
-            // DATES DU / AU : Format Date
+            // DU / AU : On force le format Date DD/MM/YYYY
             const cellDu = destRow.getCell(startCol + 1);
             const cellAu = destRow.getCell(startCol + 2);
-            cellDu.value = seq.start;
-            cellAu.value = seq.end;
+            
+            // On s'assure que la valeur est bien traitée comme une date par Excel
+            cellDu.value = seq.start instanceof Date ? seq.start : new Date(seq.start);
+            cellAu.value = seq.end instanceof Date ? seq.end : new Date(seq.end);
+            
             cellDu.numFmt = 'dd/mm/yyyy';
             cellAu.numFmt = 'dd/mm/yyyy';
           }
-          currentDestRow++;
-        });
+        }
+        currentDestRow++;
+      };
 
-        // Fusion Nom/Matricule si plusieurs lignes
+      if (sequences.length === 0) {
+        fillRow(matriculeRaw, nom);
+      } else {
+        const firstRowIndex = currentDestRow;
+        sequences.forEach(s => fillRow(matriculeRaw, nom, s));
+
         if (sequences.length > 1) {
           sheetDest.mergeCells(firstRowIndex, 1, currentDestRow - 1, 1);
           sheetDest.mergeCells(firstRowIndex, 2, currentDestRow - 1, 2);
-          const align = { vertical: 'middle', horizontal: 'left' };
-          sheetDest.getRow(firstRowIndex).getCell(1).alignment = align;
-          sheetDest.getRow(firstRowIndex).getCell(2).alignment = align;
+          sheetDest.getRow(firstRowIndex).getCell(1).alignment = { vertical: 'middle', horizontal: 'left' };
+          sheetDest.getRow(firstRowIndex).getCell(2).alignment = { vertical: 'middle', horizontal: 'left' };
         }
       }
     });
 
     const buffer = await workbookDest.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", "attachment; filename=navette_paie_finale.xlsx");
+    res.setHeader("Content-Disposition", "attachment; filename=navette_paie.xlsx");
     return res.send(buffer);
 
   } catch (err) {
@@ -122,8 +119,8 @@ function extractSequences(row, datesMap) {
   let current = null;
 
   for (let col = 3; col <= 32; col++) {
-    let cellVal = row.getCell(col).value;
-    let val = cellVal ? String(cellVal).trim().toUpperCase() : null;
+    let val = row.getCell(col).value;
+    val = val ? String(val).trim().toUpperCase() : null;
 
     if (targets.includes(val)) {
       const dateVal = datesMap[col];
@@ -146,4 +143,4 @@ function extractSequences(row, datesMap) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Serveur prêt sur port ${PORT}`));
+app.listen(PORT, () => console.log(`Listening on ${PORT}`));
