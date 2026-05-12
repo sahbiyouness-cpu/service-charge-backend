@@ -45,16 +45,21 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     sheetSource.eachRow((row, rowNumber) => {
       if (rowNumber < startRowSource) return;
 
-      const matricule = row.getCell(1).value;
+      const matriculeRaw = row.getCell(1).value;
       const nom = row.getCell(2).value;
-      if (!matricule) return;
+      if (!matriculeRaw) return;
 
       const sequences = extractSequences(row, datesMap);
 
-      // Si aucune absence, on crée quand même une ligne pour la personne
+      // Si aucune absence, on liste quand même l'employé
       if (sequences.length === 0) {
         const destRow = sheetDest.getRow(currentDestRow);
-        destRow.getCell(1).value = matricule;
+        
+        // Force le matricule en format nombre pour éviter l'affichage "date"
+        const cellMat = destRow.getCell(1);
+        cellMat.value = Number(matriculeRaw);
+        cellMat.numFmt = '0'; 
+        
         destRow.getCell(2).value = nom;
         currentDestRow++;
       } else {
@@ -62,18 +67,24 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
 
         sequences.forEach((seq) => {
           const destRow = sheetDest.getRow(currentDestRow);
-          destRow.getCell(1).value = matricule;
+          
+          // Matricule forcé en nombre
+          const cellMat = destRow.getCell(1);
+          cellMat.value = Number(matriculeRaw);
+          cellMat.numFmt = '0';
+
           destRow.getCell(2).value = nom;
 
           const colMap = { 'CA': 3, 'MALADIE': 6, 'AT': 9, 'ABS': 12 };
           const startCol = colMap[seq.type];
 
           if (startCol) {
-            // NB JR : Nombre de jours en format numérique (ex: 9)
-            destRow.getCell(startCol).value = Number(seq.count);
-            destRow.getCell(startCol).numFmt = '0'; // Force le format nombre standard
+            // NOMBRE DE JOURS : Forcé en nombre standard (ex: 2 au lieu de 02/01/1900)
+            const cellNb = destRow.getCell(startCol);
+            cellNb.value = Number(seq.count);
+            cellNb.numFmt = '0'; 
 
-            // DU / AU : Dates complètes
+            // DATES DU / AU : Format Date
             const cellDu = destRow.getCell(startCol + 1);
             const cellAu = destRow.getCell(startCol + 2);
             cellDu.value = seq.start;
@@ -84,7 +95,7 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
           currentDestRow++;
         });
 
-        // Fusion si plusieurs séquences
+        // Fusion Nom/Matricule si plusieurs lignes
         if (sequences.length > 1) {
           sheetDest.mergeCells(firstRowIndex, 1, currentDestRow - 1, 1);
           sheetDest.mergeCells(firstRowIndex, 2, currentDestRow - 1, 2);
@@ -97,7 +108,7 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
 
     const buffer = await workbookDest.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", "attachment; filename=navette_paie.xlsx");
+    res.setHeader("Content-Disposition", "attachment; filename=navette_paie_finale.xlsx");
     return res.send(buffer);
 
   } catch (err) {
@@ -111,9 +122,8 @@ function extractSequences(row, datesMap) {
   let current = null;
 
   for (let col = 3; col <= 32; col++) {
-    let cell = row.getCell(col);
-    let val = cell.value;
-    val = val ? String(val).trim().toUpperCase() : null;
+    let cellVal = row.getCell(col).value;
+    let val = cellVal ? String(cellVal).trim().toUpperCase() : null;
 
     if (targets.includes(val)) {
       const dateVal = datesMap[col];
@@ -136,4 +146,4 @@ function extractSequences(row, datesMap) {
 }
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Serveur prêt sur ${PORT}`));
+app.listen(PORT, () => console.log(`Serveur prêt sur port ${PORT}`));
