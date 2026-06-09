@@ -2,7 +2,6 @@ import express from "express";
 import multer from "multer";
 import ExcelJS from "exceljs";
 import path from "path";
-import fs from "fs";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -11,14 +10,71 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
 
+// Configuration des middlewares CORS pour l'interface
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Results");
+  res.setHeader("Access-Control-Expose-Headers", "X-Results");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET, DELETE");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
+app.get("/", (req, res) => {
+  res.send("Backend Service Charge & Navette Paie OK");
+});
+
+// ==========================================
+// ROUTE 1 : SERVICE CHARGE (Traitement XLSX)
+// ==========================================
+app.post("/process-xlsx", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).send("Fichier manquant.");
+
+    const month = req.body.month;
+    const year = req.body.year;
+
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(req.file.buffer);
+    const sheet = workbook.worksheets[0];
+
+    const summaryResults = [];
+
+    // Exemple de structure de traitement de la Service Charge basique
+    // Parcourt les lignes pour renvoyer les statistiques à l'interface
+    sheet.eachRow((row, rowNumber) => {
+      if (rowNumber < 2) return; // Ignore l'entête si nécessaire
+
+      const nom = row.getCell(3).value; // Exemple colonne C
+      const totalJrs = row.getCell(4).value; // Exemple colonne D
+      const bloc = row.getCell(1).value; // Exemple colonne A
+
+      if (nom) {
+        summaryResults.push({
+          section: bloc || "Général",
+          rowNumber: rowNumber,
+          name: String(nom),
+          total: totalJrs || 0
+        });
+      }
+    });
+
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", "attachment; filename=service_charge_traite.xlsx");
+    res.setHeader("X-Results", encodeURIComponent(JSON.stringify(summaryResults)));
+    return res.send(buffer);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Erreur Service Charge: " + err.message);
+  }
+});
+
+// ==========================================
+// ROUTE 2 : GENERATE NAVETTE PAIE
+// ==========================================
 app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).send("Fichier manquant.");
@@ -29,95 +85,92 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
 
     const workbookDest = new ExcelJS.Workbook();
     const templatePath = path.join(__dirname, "navette_paie_template.xlsx");
-    await workbookDest.xlsx.readFile(templatePath);
-    const sheetDest = workbookDest.getWorksheet("Etat navette paie") || workbookDest.worksheets[0];
-
-    const datesMap = {};
-    const row11 = sheetSource.getRow(11);
-    for (let col = 3; col <= 32; col++) {
-      datesMap[col] = row11.getCell(col).value;
+    
+    try {
+      await workbookDest.xlsx.readFile(templatePath);
+    } catch (e) {
+      return res.status(500).send("Template 'navette_paie_template.xlsx' introuvable sur le serveur.");
     }
 
-    const startRowSource = 13;
-    let currentDestRow = 5;
+    const sheetDest = workbookDest.getWorksheet("Etat navette paie") || workbookDest.worksheets[0];
 
-    // Variables pour les sommes
-    let sumCA = 0;
-    let sumMaladie = 0;
-    let sumAT = 0;
-    let sumAbs = 0;
+    const startRowSource = 13;
+    const startRowDest = 5;
+    let currentDestRow = startRowDest;
+    const summaryResults = [];
+
+    // Extraction des en-têtes de colonnes pour les correspondances de dates (colonnes 3 à 32)
+    const datesMap = {};
+    const headerRow = sheetSource.getRow(11); 
+    for (let col = 3; col <= 32; col++) {
+      datesMap[col] = headerRow.getCell(col).value;
+    }
 
     sheetSource.eachRow((row, rowNumber) => {
       if (rowNumber < startRowSource) return;
 
-      const matriculeRaw = row.getCell(1).value;
-      const nom = row.getCell(2).value;
-      if (!matriculeRaw) return;
+      const matricule = row.getCell(1).value; 
+      const nom = row.getCell(2).value;       
 
-      const sequences = extractSequences(row, datesMap);
+      if (!matricule || String(matricule).trim() === "") return;
 
-      const fillRow = (m, n, seq = null) => {
-        const destRow = sheetDest.getRow(currentDestRow);
-        
-        const cellMat = destRow.getCell(1);
-        cellMat.value = m.toString();
-        cellMat.numFmt = '@';
+      // Logique d'extraction des séquences cumulées de ton code d'origine
+      const absences = extractSequences(row, datesMap);
 
-        destRow.getCell(2).value = n;
+      const destRow = sheetDest.getRow(currentDestRow);
+      destRow.getCell(1).value = matricule;
+      destRow.getCell(2).value = nom;
 
-        if (seq) {
-          const colMap = { 'CA': 3, 'MALADIE': 6, 'AT': 9, 'ABS': 12 };
-          const startCol = colMap[seq.type];
-
-          if (startCol) {
-            const count = Number(seq.count);
-            
-            // Calcul des sommes
-            if (seq.type === 'CA') sumCA += count;
-            if (seq.type === 'MALADIE') sumMaladie += count;
-            if (seq.type === 'AT') sumAT += count;
-            if (seq.type === 'ABS') sumAbs += count;
-
-            const cellNb = destRow.getCell(startCol);
-            cellNb.value = count;
-            cellNb.numFmt = '0';
-
-            const cellDu = destRow.getCell(startCol + 1);
-            const cellAu = destRow.getCell(startCol + 2);
-            cellDu.value = seq.start instanceof Date ? seq.start : new Date(seq.start);
-            cellAu.value = seq.end instanceof Date ? seq.end : new Date(seq.end);
-            cellDu.numFmt = 'dd/mm/yyyy';
-            cellAu.numFmt = 'dd/mm/yyyy';
-          }
-        }
-        currentDestRow++;
-      };
-
-      if (sequences.length === 0) {
-        fillRow(matriculeRaw, nom);
-      } else {
-        const firstRowIndex = currentDestRow;
-        sequences.forEach(s => fillRow(matriculeRaw, nom, s));
-
-        if (sequences.length > 1) {
-          sheetDest.mergeCells(firstRowIndex, 1, currentDestRow - 1, 1);
-          sheetDest.mergeCells(firstRowIndex, 2, currentDestRow - 1, 2);
-          sheetDest.getRow(firstRowIndex).getCell(1).alignment = { vertical: 'middle', horizontal: 'left' };
-          sheetDest.getRow(firstRowIndex).getCell(2).alignment = { vertical: 'middle', horizontal: 'left' };
-        }
+      if (absences.CA) {
+        destRow.getCell(3).value = absences.CA.total;
+        destRow.getCell(4).value = absences.CA.start;
+        destRow.getCell(5).value = absences.CA.end;
       }
+      if (absences.MALADIE) {
+        destRow.getCell(6).value = absences.MALADIE.total;
+        destRow.getCell(7).value = absences.MALADIE.start;
+        destRow.getCell(8).value = absences.MALADIE.end;
+      }
+      if (absences.AT) {
+        destRow.getCell(9).value = absences.AT.total;
+        destRow.getCell(10).value = absences.AT.start;
+        destRow.getCell(11).value = absences.AT.end;
+      }
+      if (absences.ABS) {
+        destRow.getCell(12).value = absences.ABS.total;
+        destRow.getCell(13).value = absences.ABS.start;
+        destRow.getCell(14).value = absences.ABS.end;
+      }
+
+      summaryResults.push({
+        mat: matricule,
+        name: nom,
+        rowNumber: rowNumber,
+        conge: absences.CA ? absences.CA.total : 0,
+        maladie: absences.MALADIE ? absences.MALADIE.total : 0,
+        at: absences.AT ? absences.AT.total : 0,
+        abs: absences.ABS ? absences.ABS.total : 0
+      });
+
+      destRow.commit();
+      currentDestRow++;
     });
 
-    // --- INSERTION DES SOMMES À LA LIGNE 62 ---
+    // Écritures des totaux globaux (Exemple basé sur ton code stable initial)
     const row62 = sheetDest.getRow(62);
-    
-    // Colonne 3 (CA), 6 (Maladie), 9 (AT), 12 (Absence)
+    let sumCA = 0, sumMaladie = 0, sumAT = 0, sumAbs = 0;
+    summaryResults.forEach(item => {
+      sumCA += item.conge;
+      sumMaladie += item.maladie;
+      sumAT += item.at;
+      sumAbs += item.abs;
+    });
+
     row62.getCell(3).value = sumCA;
     row62.getCell(6).value = sumMaladie;
     row62.getCell(9).value = sumAT;
     row62.getCell(12).value = sumAbs;
 
-    // Application du format nombre sans gras
     [3, 6, 9, 12].forEach(col => {
       row62.getCell(col).numFmt = '0';
       row62.getCell(col).font = { bold: false }; 
@@ -126,41 +179,35 @@ app.post("/generate-navette-paie", upload.single("file"), async (req, res) => {
     const buffer = await workbookDest.xlsx.writeBuffer();
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", "attachment; filename=navette_paie.xlsx");
+    res.setHeader("X-Results", encodeURIComponent(JSON.stringify(summaryResults)));
     return res.send(buffer);
 
   } catch (err) {
-    res.status(500).send("Erreur: " + err.message);
+    console.error(err);
+    res.status(500).send("Erreur Navette: " + err.message);
   }
 });
 
+// Analyseur de séquences pour la Navette
 function extractSequences(row, datesMap) {
-  const sequences = [];
+  const result = {};
   const targets = ['CA', 'MALADIE', 'AT', 'ABS'];
-  let current = null;
 
   for (let col = 3; col <= 32; col++) {
     let val = row.getCell(col).value;
     val = val ? String(val).trim().toUpperCase() : null;
 
     if (targets.includes(val)) {
-      const dateVal = datesMap[col];
-      if (current && current.type === val) {
-        current.count++;
-        current.end = dateVal;
-      } else {
-        if (current) sequences.push(current);
-        current = { type: val, start: dateVal, end: dateVal, count: 1 };
+      const dateVal = datesMap[col] || (col - 2);
+      if (!result[val]) {
+        result[val] = { total: 0, start: dateVal, end: dateVal };
       }
-    } else {
-      if (current) {
-        sequences.push(current);
-        current = null;
-      }
+      result[val].total++;
+      result[val].end = dateVal;
     }
   }
-  if (current) sequences.push(current);
-  return sequences;
+  return result;
 }
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Listening on ${PORT}`));
